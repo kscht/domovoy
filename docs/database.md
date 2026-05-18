@@ -8174,8 +8174,236 @@ WHERE kind = "воркер-инстанс"
 
 ---
 
+## История: перемещения, изменения, корзина
+
+### История перемещений
+
+Рёбра `contains` и `located_at` получают временны́е метки. Активная позиция — `ended_at = NONE`. История — все записи с заполненным `ended_at`. Полная цепочка хранится в одной таблице без дополнительных структур.
+
+```surql
+DEFINE FIELD started_at ON contains TYPE datetime DEFAULT time::now();
+DEFINE FIELD ended_at   ON contains TYPE option<datetime>;
+DEFINE FIELD moved_by   ON contains TYPE option<record<thing>>;
+
+DEFINE FIELD started_at ON located_at TYPE datetime DEFAULT time::now();
+DEFINE FIELD ended_at   ON located_at TYPE option<datetime>;
+DEFINE FIELD moved_by   ON located_at TYPE option<record<thing>>;
+```
+
+**Переместить вещь:**
+```surql
+-- Закрыть текущую позицию
+UPDATE (
+  SELECT id FROM contains WHERE out = $thing AND ended_at = NONE
+) SET ended_at = time::now(), moved_by = $auth;
+
+-- Открыть новую
+RELATE $new_location->contains->$thing SET
+  started_at = time::now(),
+  moved_by   = $auth;
+```
+
+**Текущее местонахождение:**
+```surql
+SELECT <-contains<-thing[WHERE ended_at = NONE] AS где
+FROM thing WHERE id = $thing;
+```
+
+**Вся история перемещений вещи:**
+```surql
+SELECT in.name AS откуда, out.name AS что,
+       started_at, ended_at,
+       moved_by.name AS кто
+FROM contains
+WHERE out = $thing
+ORDER BY started_at ASC;
+```
+
+**Что сейчас находится в этом месте (рекурсивно):**
+```surql
+SELECT name, kind,
+       <-contains[WHERE ended_at = NONE].started_at AS здесь_с
+FROM thing
+WHERE <-contains<-thing[WHERE ended_at = NONE] = $location;
+```
+
+### История изменений
+
+`DEFINE EVENT` фиксирует каждое изменение поля. Хранится только diff — не полный снимок — чтобы не раздувать базу. `kind: снимок` создаётся вручную или по расписанию для важных точек (публикация, архивация, до удаления).
+
+```surql
+-- Новый kind для записи изменения
+-- (schemaless, живёт в той же таблице thing)
+
+DEFINE EVENT audit ON TABLE thing
+  WHEN $event = "UPDATE"
+THEN {
+  -- считаем изменённые поля
+  LET $diff = object::keys($after).filter(|$k| $before[$k] != $after[$k])
+    .reduce(|$acc, $k| object::add($acc, $k, {
+        before: $before[$k],
+        after:  $after[$k]
+      }), {});
+
+  -- не пишем если изменилось только служебное
+  LET $skip = ["updated_at", "last_heartbeat", "lock_expires_at"];
+  LET $real = object::keys($diff).filter(|$k| !$skip.contains($k));
+
+  IF array::len($real) > 0 THEN {
+    CREATE thing SET
+      kind       = "изменение",
+      about      = $after.id,
+      changed_by = $auth,
+      changed_at = time::now(),
+      event      = $event,
+      diff       = $diff;
+  };
+};
+```
+
+**`kind: снимок`** — полное состояние в момент времени:
+```surql
+-- Создать снимок вручную (перед удалением, публикацией, архивацией)
+CREATE thing SET
+  kind     = "снимок",
+  about    = $target_id,
+  state    = (SELECT * FROM thing WHERE id = $target_id),
+  taken_at = time::now(),
+  taken_by = $auth,
+  reason   = "перед удалением";   -- или "публикация v2", "архив"
+```
+
+**История изменений узла:**
+```surql
+SELECT changed_at, changed_by.name AS кто, diff
+FROM thing
+WHERE kind = "изменение" AND about = $target_id
+ORDER BY changed_at DESC;
+```
+
+**Кто и когда менял статус задачи:**
+```surql
+SELECT changed_at, changed_by.name AS кто,
+       diff.status.before AS было,
+       diff.status.after  AS стало
+FROM thing
+WHERE kind = "изменение"
+  AND about = $task_id
+  AND diff.status != NONE
+ORDER BY changed_at ASC;
+```
+
+**Все изменения пользователя за день:**
+```surql
+SELECT about.name AS объект, about.kind AS тип,
+       changed_at, diff
+FROM thing
+WHERE kind = "изменение"
+  AND changed_by = $auth
+  AND changed_at > time::now() - 1d
+ORDER BY changed_at DESC;
+```
+
+### Корзина (soft delete)
+
+Удаление не стирает запись — переводит в статус `"удалён"`. Все обычные запросы фильтруют этот статус. Через 30 дней — авто-очистка через DEFINE EVENT.
+
+**Поля на `thing` (schemaless, не требуют миграции):**
+```
+deleted_at:         datetime
+deleted_by:         record<thing>
+previous_status:    string          ← для восстановления
+delete_reason:      string
+scheduled_purge_at: datetime        ← когда удалить физически
+```
+
+**Удалить в корзину:**
+```surql
+UPDATE thing SET
+  previous_status    = status,
+  status             = "удалён",
+  deleted_at         = time::now(),
+  deleted_by         = $auth,
+  delete_reason      = $reason,
+  scheduled_purge_at = time::now() + 30d
+WHERE id = $id;
+```
+
+**Восстановить из корзины:**
+```surql
+UPDATE thing SET
+  status             = previous_status,
+  deleted_at         = NONE,
+  deleted_by         = NONE,
+  delete_reason      = NONE,
+  previous_status    = NONE,
+  scheduled_purge_at = NONE
+WHERE id = $id AND status = "удалён";
+```
+
+**Содержимое корзины:**
+```surql
+SELECT name, kind, deleted_at, deleted_by.name AS кто,
+       delete_reason, scheduled_purge_at
+FROM thing
+WHERE status = "удалён"
+  AND (<-can_access<-thing = $auth OR deleted_by = $auth)
+ORDER BY deleted_at DESC;
+```
+
+**Авто-очистка по расписанию (DEFINE EVENT):**
+```surql
+DEFINE EVENT purge_deleted ON TABLE thing
+  WHEN $after.scheduled_purge_at != NONE
+    AND $after.scheduled_purge_at < time::now()
+    AND $after.status = "удалён"
+THEN {
+  -- снимок перед удалением (опционально, для архива)
+  CREATE thing SET
+    kind     = "снимок",
+    about    = $after.id,
+    state    = $after,
+    taken_at = time::now(),
+    reason   = "авто-архив перед удалением";
+
+  -- физическое удаление
+  DELETE $after.id;
+};
+```
+
+**Стандартный фильтр во всех запросах:**
+```surql
+-- Везде добавляем: AND (status = NONE OR status != "удалён")
+-- Или через вспомогательный параметр сессии:
+DEFINE PARAM $show_deleted VALUE false;
+
+SELECT * FROM thing
+WHERE kind = "задача"
+  AND ($show_deleted OR status != "удалён");
+```
+
+### Связь между тремя механизмами
+
+При удалении создаётся снимок + запись в истории изменений:
+```
+Пользователь удаляет thing:item_vase
+  → UPDATE status = "удалён"
+  → DEFINE EVENT audit     → kind: изменение  (status: активен → удалён)
+  → CREATE kind: снимок    (полное состояние до удаления)
+  → через 30 дней: DEFINE EVENT purge → DELETE
+```
+
+При перемещении фиксируется в истории рёбер:
+```
+contains (in: шкаф, out: ваза) ended_at = now()
+contains (in: кладовка, out: ваза) started_at = now()
+  → DEFINE EVENT audit → kind: изменение (перемещение)
+```
+
+---
+
 ## Открытые вопросы
 
-- [ ] История перемещений вещей?
+- [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
 - [ ] Повторяющиеся задачи — шаблон с расписанием (каждую субботу, каждые 10000 км)?
 - [x] Уведомления — push или только в приложении? → шлюз `kind: push` + другие каналы
