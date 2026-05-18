@@ -195,45 +195,151 @@ graph TD
 
 ## Доступ и шаринг
 
-`can_access` работает напрямую на конкретные вещи — без глобальных пространств.  
-**Каскад:** доступ к вещи автоматически даёт доступ ко всему `part_of` неё вглубь.
+`can_access` — прямое ребро от субъекта к ресурсу. Два правила против рекурсии:
+
+1. **Нет каскада по рёбрам** — доступ к контейнеру не наследуется дочерними узлами автоматически. Доступ к `thing:share_legal` даёт доступ только к нему; содержимое (`part_of`) проверяется отдельным запросом.
+2. **Одно звено через группу** — если субъект `part_of` группы, а группа `can_access` ресурсу — это максимальная глубина. Дальнейший обход не ведётся.
+
+### Поля ребра can_access
+
+```
+can_access
+  permissions:            ["view"]          ← множество прав
+  status:                 active            ← active | pending | revoked
+  granted_by:             thing:son         ← кто инициировал
+  requires_approval_from: thing:admins      ← группа, любой член которой может подтвердить
+  approved_by:            thing:dad         ← конкретный член группы кто подтвердил
+  approved_at:            datetime
+  expires_at:             datetime | null   ← временный доступ
+  reason:                 string | null     ← причина выдачи
+```
+
+Уровни прав (`permissions`):
+
+| Право | Смысл |
+|-------|-------|
+| `view` | читать узел и его поля |
+| `edit` | изменять поля, добавлять дочерние узлы |
+| `delete` | удалять узел |
+| `run` | выполнять код / пайплайн / триггер |
+| `share` | выдавать доступ другим (не выше своего уровня) |
+| `manage` | менять права (владелец) |
+
+### Группа подтверждающих
+
+`requires_approval_from` — это `thing`-узел группы. Подтвердить может **любой** её член.
+`approved_by` фиксирует кто именно подтвердил.
+
+```
+thing:family_admins
+  name: "Семейные администраторы"
+  ← part_of ← thing:dad
+  ← part_of ← thing:mom
+```
 
 ```mermaid
 graph TD
+    Son[Сын]
+    Friend[Друг Коля]
     Dad[Папа]
     Mom[Мама]
+    Admins[Семейные администраторы]
+    Vault[Семейный vault]
+    Share[Подборка для Коли]
+
+    Dad -->|part_of| Admins
+    Mom -->|part_of| Admins
+
+    Son -->|"can_access\nstatus: pending\ngranted_by: Сын\nrequires_approval_from: Admins"| Share
+    Friend -.->|"ждёт подтверждения"| Share
+    Share -->|part_of| Vault
+    Dad -->|"approved_by → active"| Son
+```
+
+Пока `status: pending` — Коля доступа не имеет.
+Папа или Мама видит задачу-уведомление и подтверждает → `status: active`, `approved_by: dad`.
+
+### Запрос: разрешение доступа
+
+```surql
+-- Есть ли у person:x право edit на thing:resource?
+-- Прямой доступ + доступ через группу (одно звено, не глубже)
+SELECT permissions, status, expires_at FROM can_access
+WHERE out = thing:resource
+  AND in INSIDE [
+    thing:person_x,
+    ...(SELECT out FROM part_of WHERE in = thing:person_x)
+  ]
+  AND "edit" INSIDE permissions
+  AND status = "active"
+  AND (expires_at = NONE OR expires_at > time::now());
+
+-- Все pending-запросы, которые может подтвердить person:dad
+SELECT in.name AS кто_дал, out.name AS ресурс,
+       permissions, reason,
+       requires_approval_from.name AS группа
+FROM can_access
+WHERE status = "pending"
+  AND requires_approval_from IN (
+    SELECT out FROM part_of WHERE in = thing:dad
+  );
+
+-- Аудит: кто, кому, что и когда дал доступ
+SELECT granted_by.name AS инициатор,
+       in.name AS субъект,
+       out.name AS ресурс,
+       permissions, status,
+       approved_by.name AS подтвердил,
+       approved_at, expires_at
+FROM can_access
+ORDER BY approved_at DESC;
+```
+
+### Автоматическое уведомление при pending
+
+```surql
+DEFINE EVENT notify_approvers ON TABLE can_access
+  WHEN $event = "CREATE" AND $value.status = "pending"
+  THEN {
+    CREATE thing SET
+      kind        = "задача",
+      name        = "Подтвердить выдачу доступа",
+      status      = "не начато",
+      priority    = "высокий",
+      created_at  = time::now()
+    ;
+    RELATE $last->assigned_to->$value.requires_approval_from;
+    RELATE $last->about->$after.id;
+  };
+```
+
+### Пример: доступ к документам
+
+```mermaid
+graph TD
     Alexey[Алексей\nюрпомощник]
     Doctor[Доктор Петров]
+    Mom[Мама]
+    Dad[Папа]
+    Admins[Администраторы\nМама + Папа]
 
     ShareLegal[Подборка для Алексея]
     ShareMed[Снимки для Петрова]
-
-    Case1[Дело о заборе]
-    Case3[Дело о земле]
-    Xray[Снимки рентгена]
-    Mri[МРТ колена]
-
     PersonalMom[Личные задачи мамы]
-    Task1[Записаться к косметологу]
-    Task2[Продлить абонемент]
 
-    Case1 -->|part_of| ShareLegal
-    Case3 -->|part_of| ShareLegal
-    Xray -->|part_of| ShareMed
-    Mri -->|part_of| ShareMed
-    Task1 -->|part_of| PersonalMom
-    Task2 -->|part_of| PersonalMom
+    Case1[Дело о заборе] -->|part_of| ShareLegal
+    Case3[Дело о земле]  -->|part_of| ShareLegal
+    Xray[Снимки рентгена] -->|part_of| ShareMed
+    Mri[МРТ колена]       -->|part_of| ShareMed
 
-    Alexey -->|can_access| ShareLegal
-    Doctor -->|can_access| ShareMed
-    Mom -->|can_access| PersonalMom
-    Dad -->|can_access| Case1
-    Dad -->|can_access| Case3
+    Alexey -->|"can_access [view]\ngranted_by: Папа\nstatus: active"| ShareLegal
+    Doctor -->|"can_access [view]\nrequires_approval_from: Admins\nstatus: pending"| ShareMed
+    Mom    -->|"can_access [manage]"| PersonalMom
+    Dad    -->|"can_access [view, edit]"| ShareLegal
 ```
 
-**Шаблон доступа** — заранее созданный контейнер с типовым набором.  
-Пример: "Доступ врача" — контейнер с нужными цифровыми копиями,  
-врачу выдаётся `can_access` к этому контейнеру и ничего лишнего.
+**Шаблон доступа** — заранее созданный контейнер с типовым набором.
+Врачу выдаётся `can_access` к контейнеру с нужными копиями — и ничего лишнего.
 
 ---
 
@@ -746,7 +852,15 @@ DEFINE FIELD unit     ON used TYPE option<string>;
 
 DEFINE TABLE represents TYPE RELATION FROM thing TO thing;
 
-DEFINE TABLE can_access TYPE RELATION FROM thing TO thing;
+DEFINE TABLE can_access TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD permissions            ON can_access TYPE set<string> DEFAULT ["view"];
+DEFINE FIELD status                 ON can_access TYPE string      DEFAULT "active";
+DEFINE FIELD granted_by             ON can_access TYPE option<record<thing>>;
+DEFINE FIELD requires_approval_from ON can_access TYPE option<record<thing>>;
+DEFINE FIELD approved_by            ON can_access TYPE option<record<thing>>;
+DEFINE FIELD approved_at            ON can_access TYPE option<datetime>;
+DEFINE FIELD expires_at             ON can_access TYPE option<datetime>;
+DEFINE FIELD reason                 ON can_access TYPE option<string>;
 
 DEFINE TABLE related_to TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD label ON related_to TYPE string;
