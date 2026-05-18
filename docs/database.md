@@ -1802,12 +1802,12 @@ graph TD
     Marina[Марина\nжена Алексея]
     Peter[Пётр\nдруг]
 
-    Phone1[+7-900-123-45-67\ntype: phone\nlabel: личный]
-    Phone2[+7-495-111-22-33\ntype: phone\nlabel: рабочий]
-    Email1[alex@firm.ru\ntype: email\nlabel: рабочий]
-    TG[alexey_iv\ntype: messenger\nplatform: Telegram]
-    WA[+7-900-123-45-67\ntype: messenger\nplatform: WhatsApp]
-    Addr[ул. Садовая 5 кв. 12\ntype: address\nlabel: домашний]
+    Phone1["+7-900-123-45-67\ntype: phone\nlabel: личный"]
+    Phone2["+7-495-111-22-33\ntype: phone\nlabel: рабочий"]
+    Email1["alex@firm.ru\ntype: email\nlabel: рабочий"]
+    TG["alexey_iv\ntype: messenger\nplatform: Telegram"]
+    WA["+7-900-123-45-67\ntype: messenger\nplatform: WhatsApp"]
+    Addr["ул. Садовая 5 кв. 12\ntype: address\nlabel: домашний"]
 
     Phone1 -->|part_of| Alexey
     Phone2 -->|part_of| Alexey
