@@ -4239,14 +4239,88 @@ SELECT _cloned_from AS оригинал, _cloned_instance AS откуда,
 FROM thing
 WHERE _cloned_from != NONE
 ORDER BY _cloned_at DESC;
+```
 
--- Проверить: обновился ли оригинал с момента клонирования (через datasource)
-SELECT t.name, t._cloned_at,
-       t._cloned_at < ds.last_sync_at AS устарел
-FROM thing AS t, thing AS ds
-WHERE t._cloned_from != NONE
-  AND ds.kind = "источник-данных"
-  AND ds.instance_id = t._cloned_instance;
+### Синхронизация клона с источником
+
+Клон может подписаться на обновления из источника. Три поля управляют поведением:
+
+```
+thing:my_quiz_geography
+  _cloned_from:         "thing:quiz_geo"
+  _cloned_instance:     "abc123"
+  _cloned_at:           2026-05-19T10:00:00Z
+  _sync_upstream:       true                   ← подписан на обновления
+  _last_upstream_sync:  2026-05-19T10:00:00Z   ← водяной знак — откуда тянуть
+  _sync_policy:         merge                  ← merge | upstream-wins | local-wins
+```
+
+**Три политики синхронизации:**
+
+| Политика | Поведение | Когда использовать |
+|----------|-----------|-------------------|
+| `upstream-wins` | источник всегда перезаписывает | каталог цен, справочник |
+| `local-wins` | применять только новые поля, пропускать отредактированные | кастомизированный шаблон |
+| `merge` | LWW по HLC + флаг конфликта при истинных столкновениях | совместный квиз |
+
+**Алгоритм синхронизации клона:**
+
+```
+1. Запросить у источника change_log WHERE hlc > _last_upstream_sync
+2. Для каждого изменения найти локальный клон по _cloned_from = original_id
+3. Применить по политике:
+     upstream-wins → UPDATE local SET field = new_value
+     local-wins    → UPDATE local SET field = new_value
+                       только если поле не менялось локально после _cloned_at
+     merge         → если local.field не менялось → apply
+                     если оба менялись → LWW по HLC, при равенстве → has_conflict: true
+4. Обновить _last_upstream_sync = max(hlc обработанных изменений)
+```
+
+```surql
+-- Изменения в источнике после последней синхронизации клона
+-- (выполняется через datasource к источнику)
+SELECT node_id, field, new_value, hlc FROM change_log
+WHERE hlc > $last_upstream_sync
+  AND node_id INSIDE $cloned_origin_ids
+ORDER BY hlc ASC;
+
+-- Клоны с подпиской, у которых источник обновился
+SELECT name, _cloned_instance, _last_upstream_sync,
+       _sync_policy
+FROM thing
+WHERE _sync_upstream = true
+  AND _cloned_from != NONE
+ORDER BY _last_upstream_sync ASC;
+
+-- Клоны с неразрешёнными конфликтами после merge
+SELECT name, conflict_fields FROM thing
+WHERE _cloned_from != NONE AND has_conflict = true;
+```
+
+**Автоматическая синхронизация по расписанию:**
+
+```
+thing:schedule_clone_sync
+  kind: расписание
+  cron: "0 * * * *"          ← каждый час
+  → produces → thing:queue_sync_clones
+
+-- Пайплайн для каждого подписанного клона:
+-- 1. Получить change_log из источника (datasource)
+-- 2. Применить по политике
+-- 3. Обновить _last_upstream_sync
+-- 4. Если merge + конфликт → создать задачу для пользователя
+```
+
+**Уведомление о значимых обновлениях:**
+
+Не все изменения в источнике одинаково важны. Можно подписаться на конкретные поля:
+
+```
+thing:my_quiz_geography
+  _watch_fields: ["questions", "correct_answer"]   ← только эти поля триггерят уведомление
+  _ignore_fields: ["view_count", "updated_at"]     ← эти пропускать тихо
 ```
 
 ---
