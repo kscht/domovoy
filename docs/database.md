@@ -121,14 +121,12 @@ SELECT * FROM thing WHERE status = "в процессе" AND template != true;
 | `represents` | Цифровая копия → физический оригинал | — |
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
-| `references` | Блок ссылается на другой блок с режимом включения | `mode`, `source_file`, `anchor`, `snapshot_text`, `snapshot_at` |
+| `references` | Блок ссылается на другой блок с режимом включения | `mode`, `snapshot_text`, `snapshot_at` |
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
 **`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
 **`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`  
-**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации  
-**`source_file` на ребре `references`:** имя `.md` файла внутри директории цели — для трансклюзии целого файла или секции без `thing`-узла  
-**`anchor` на ребре `references`:** якорь `^id` внутри файла — для трансклюзии конкретной секции
+**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации
 
 ---
 
@@ -753,8 +751,6 @@ DEFINE FIELD label ON related_to TYPE string;
 
 DEFINE TABLE references TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD mode          ON references TYPE string;
-DEFINE FIELD source_file   ON references TYPE option<string>;
-DEFINE FIELD anchor        ON references TYPE option<string>;
 DEFINE FIELD snapshot_text ON references TYPE option<string>;
 DEFINE FIELD snapshot_at   ON references TYPE option<datetime>;
 ```
@@ -842,8 +838,6 @@ SELECT * FROM thing WHERE postponed_count > 2
       - платформа: текст           # для мессенджеров: Telegram / WhatsApp / Signal / ВКонтакте
       - метка: текст               # для контактов: личный / рабочий / домашний
       - предпочтительный: булево   # true = основной способ связи
-      - source_file: текст         # для promoted block: имя .md файла в директории владельца
-      - anchor: текст              # для promoted block: якорь секции в файле (без ^)
       - filename: текст            # для файловых узлов: имя файла на диске ("scan.pdf")
       - mime_type: текст           # для файловых узлов: "image/jpeg", "application/pdf"
       - size: число                # размер файла в байтах
@@ -989,13 +983,11 @@ SELECT * FROM thing WHERE postponed_count > 2
       - label: текст
 
   references:
-    описание: блок или узел ссылается на другой узел или Markdown-файл
-    от: thing   # блок-источник или любой thing с документом
-    к: thing    # блок-цель, promoted block, или владелец файла
+    описание: блок ссылается на другой блок с тремя режимами поведения
+    от: thing   # блок-источник (в документе)
+    к: thing    # блок-цель (любой thing с text)
     поля:
       - mode: текст           # live / snapshot / link
-      - source_file: текст    # имя .md файла в директории цели ("protocol.md")
-      - anchor: текст         # якорь секции в файле ("protocol-anchor"), без ^
       - snapshot_text: текст  # для mode=snapshot: замороженный текст цели на момент фиксации
       - snapshot_at: дата     # когда был сделан снапшот
 ```
@@ -1816,56 +1808,23 @@ SELECT DISTINCT
 
 ## Сценарий: блочные документы и трансклюзия
 
-Документ — `thing`-контейнер. Блоки (параграфы, заголовки, рисунки) — `thing` с `part_of`
-и полем `order` на ребре для порядка. Блок может включать другой блок тремя способами
-через ребро `references`.
+Весь контент хранится в БД. Блоки — `thing`-узлы с `text`. Документ — `thing`-контейнер,
+блоки упорядочены через `order` на ребре `part_of`. Vault-директория — только для
+бинарных файлов (изображения, PDF, видео). Редактирование — только во внутреннем редакторе.
 
-### Философия: Markdown-файлы первичны, `thing`-узлы — исключение
+### Типы блоков
 
-Контент живёт в `.md` файлах на диске. UUID не назначаются каждому абзацу автоматически.
-Блок становится `thing`-узлом только тогда, когда человек или AI решили, что он нужен в графе —
-например, его нужно транскузировать в другой документ, назначить на него задачу, или дать доступ.
+Поле `type` на блоке:
 
-```
-~/.domovoy/files/
-├── experiment_crystals/
-│   ├── protocol.md        ← просто текст, никаких UUID на абзацы
-│   └── observations.md
-└── article_crystallization/
-    └── draft.md
-```
-
-**Promoted block** — секция файла, получившая якорь и `thing`-узел:
-
-```markdown
-## Протокол кристаллизации
-^protocol-anchor
-
-Растворить 50г соли в 200мл воды при t=80°C...
-Охладить до комнатной температуры в течение 24 часов.
-```
-
-```
-thing:block_protocol
-  type: block
-  source_file: "protocol.md"     ← файл внутри директории experiment_crystals
-  anchor: "protocol-anchor"      ← якорь в файле (без ^)
-  text: "Растворить 50г..."      ← кешированная копия для быстрых запросов
-  → part_of → thing:experiment_crystals
-```
-
-Редактирование — в файле. При сохранении приложение обновляет кеш `text` в узле.
-AI предлагает промоут: *"Это определение встречается в 4 документах — добавить якорь?"*
-
-### Три режима включения
-
-| Режим | Что включается | Что хранится на ребре |
-|-------|---------------|----------------------|
-| `live` файл | Весь `.md` файл, читается с диска | `source_file` |
-| `live` секция | Секция файла по якорю | `source_file` + `anchor` |
-| `live` узел | `text` поле `thing`-узла (promoted block) | только ребро к узлу |
-| `snapshot` | Заморожено в `snapshot_text` | `snapshot_text` + `snapshot_at` |
-| `link` | Кликабельная ссылка, навигация | только ребро |
+| `type` | Описание |
+|--------|---------|
+| `paragraph` | Обычный текст |
+| `heading` | Заголовок (+ поле `level`: 1/2/3) |
+| `figure` | Изображение из vault (`filename` + `caption`) |
+| `formula` | Математическая формула |
+| `code` | Блок кода (+ поле `language`) |
+| `callout` | Выноска / предупреждение |
+| `citation` | Ссылка на источник |
 
 ### Структура документа
 
@@ -1873,100 +1832,71 @@ AI предлагает промоут: *"Это определение встр
 graph TD
     Article[Статья: Кристаллизация\nkind: document\nstatus: черновик]
 
-    Abs[Абстракт\ntype: paragraph\norder: 1]
-    S1[Раздел: Введение\ntype: heading\norder: 2]
-    S2[Раздел: Методология\ntype: heading\norder: 3]
-    S3[Раздел: Результаты\ntype: heading\norder: 4]
-
+    Abs[Абстракт\ntype: paragraph\ntext: Данная работа...\norder: 1]
+    S1[Введение\ntype: heading\nlevel: 1\norder: 2]
     P1[Параграф введения\ntype: paragraph\norder: 1]
-    DefEmbed[Embed-блок\ntype: embed\norder: 2]
-    Definition[Определение кристаллизации\ntype: paragraph]
+    S2[Методология\ntype: heading\nlevel: 1\norder: 3]
+    ProtoBlock[Протокол\ntype: paragraph\ntext: Растворить 50г...\norder: 1]
+    S3[Результаты\ntype: heading\nlevel: 1\norder: 4]
+    Fig1[Рис. 1\ntype: figure\nfilename: figure1.png\ncaption: График зависимости\norder: 1]
+    ResultBlock[Таблица измерений\ntype: paragraph\norder: 2]
 
-    ProtoEmbed[Embed-блок\ntype: embed\norder: 1]
-    Protocol[Протокол опыта №3\ntype: paragraph]
+    Abs  -->|part_of, order:1| Article
+    S1   -->|part_of, order:2| Article
+    S2   -->|part_of, order:3| Article
+    S3   -->|part_of, order:4| Article
 
-    ResultSnap[Снапшот таблицы\ntype: snapshot\norder: 1]
-    Table[Таблица измерений\ntype: paragraph]
+    P1         -->|part_of, order:1| S1
+    ProtoBlock -->|part_of, order:1| S2
+    Fig1       -->|part_of, order:1| S3
+    ResultBlock -->|part_of, order:2| S3
 
-    Abs -->|part_of, order:1| Article
-    S1  -->|part_of, order:2| Article
-    S2  -->|part_of, order:3| Article
-    S3  -->|part_of, order:4| Article
-
-    P1      -->|part_of, order:1| S1
-    DefEmbed -->|part_of, order:2| S1
-    DefEmbed -->|references, mode:live| Definition
-
-    ProtoEmbed -->|part_of, order:1| S2
-    ProtoEmbed -->|references, mode:live| Protocol
-
-    ResultSnap -->|part_of, order:1| S3
-    ResultSnap -->|references, mode:snapshot\nsnapshot_at: 18 мая| Table
-
-    Article -->|about| Topic[Тема: кристаллизация]
     Article -->|about| Experiment[Опыт №3]
     Article -->|produces| Publication[Публикация в журнале]
+    ProtoBlock -->|part_of| Experiment
 ```
 
-**Протокол** живёт в записи Опыта №3. Статья включает его через `live` — при редактировании
-протокола статья обновляется автоматически везде.
+Протокол — один узел. В статье он `part_of` раздела "Методология". Он же `part_of` Опыта №3.
+Один блок — несколько родителей через `part_of`. Изменился в одном месте — изменился везде.
 
-**Таблица результатов** зафиксирована снапшотом на дату публикации. Если данные
-в лабораторном журнале пересчитают — статья не изменится.
+### Три режима ребра `references`
 
-### Снапшот: обновление вручную
+`references` нужен когда блок включается **только для чтения** — не редактируется на месте,
+а отображается как вставка из другого контекста.
 
-```mermaid
-graph LR
-    Snap[references\nmode: snapshot\nsnapshot_text: старый текст\nsnapshot_at: 1 мая]
-    Original[Оригинальный блок\ntext: новый текст]
+| `mode` | Поведение | Когда использовать |
+|--------|-----------|-------------------|
+| `live` | Рендерить актуальный `text` цели | Блок из другого документа — всегда актуален |
+| `snapshot` | Рендерить `snapshot_text` с ребра | Данные зафиксированы на дату публикации |
+| `link` | Кликабельная ссылка | Ссылка на источник, навигация |
 
-    Snap -->|к| Original
-```
+**Разница `part_of` vs `references`:**  
+`part_of` — блок полноправно принадлежит документу, редактируется там.  
+`references` — блок отображается, но редактируется в другом месте.
 
-Пользователь видит предупреждение: "Источник изменился с момента снапшота".
-Нажимает "обновить" → `snapshot_text` копируется из `original.text`, `snapshot_at` обновляется.
+### Изображения
 
-### Ссылка внутри текста
-
-Блок может содержать разметку `[[thing:block_id]]` прямо в поле `text`.
-Рендерер разбирает текст и создаёт кликабельные ссылки.
-Для graph-запросов дублируется как ребро `references, mode: link`:
+Файл лежит в vault-директории документа-владельца. Блок типа `figure` хранит `filename`:
 
 ```
-text: "Как показано в [[thing:table_results]], зависимость..."
-→ references, mode:link → thing:table_results
+thing:block_fig1
+  type: figure
+  filename: "figure1.png"     ← ~/domovoy/files/article_crystallization/figure1.png
+  caption: "График зависимости температуры"
+  → part_of → thing:section_results, order: 1
 ```
 
-Оба представления нужны: `text` — для редактора, ребро — для запросов "где используется блок".
-
-### Тип блока
-
-Поле `type` на блоках:
-
-| `type` | Описание |
-|--------|---------|
-| `paragraph` | Обычный текст |
-| `heading` | Заголовок раздела (+ поле `level`: 1/2/3) |
-| `figure` | Рисунок или изображение |
-| `formula` | Математическая формула |
-| `code` | Блок кода |
-| `embed` | Контейнер для live-трансклюзии |
-| `snapshot` | Контейнер для зафиксированного снапшота |
-| `citation` | Ссылка на источник |
-| `callout` | Выноска / предупреждение |
+Рендерер строит путь: `filesDir(document_id) + "/" + filename`.
 
 ### Источники и цитаты
 
-Источник — `thing` с полями `author`, `year`, `doi`, `url`. Цитата — `references, mode: link`
-из блока на источник. Статья агрегирует все источники через graph-запрос.
+Источник — `thing` с полями `author`, `year`, `doi`, `url`.
+Цитата в тексте — `references, mode: link` из блока на источник.
 
 ```mermaid
 graph TD
     Article[Статья]
-    P2[Параграф 2]
-    Cite1[references\nmode: link]
-    Cite2[references\nmode: link]
+    P2[Параграф 2\ntype: paragraph]
     Src1[Smith 2020\nauthor: Smith J.\nyear: 2020\ndoi: 10.1234/...]
     Src2[Jones 2019\nauthor: Jones A.\nyear: 2019\nurl: ...]
 
@@ -1975,35 +1905,45 @@ graph TD
     P2 -->|references, mode:link| Src2
 ```
 
-```surql
--- Все источники статьи
-SELECT ->references->thing[WHERE year != NONE].*
-FROM thing WHERE ->part_of->thing = thing:article_crystallization
-  AND mode = "link";
+### Снапшот: обновление вручную
 
--- Все места где используется блок (live + snapshot)
+Когда источник изменился после фиксации — приложение показывает предупреждение.
+Пользователь нажимает "обновить": `snapshot_text` копируется из текущего `text` источника.
+
+```surql
+UPDATE references SET
+  snapshot_text = (SELECT text FROM thing WHERE id = ->thing)[0].text,
+  snapshot_at   = time::now()
+WHERE id = references:snap_results_table;
+```
+
+```surql
+-- Весь документ одним запросом (блоки + встроенные трансклюзии)
+SELECT id, type, text, filename, caption, level,
+  ->part_of.order AS pos,
+  ->references[WHERE mode = "live"]->thing.text AS embed_live,
+  ->references[WHERE mode = "snapshot"].snapshot_text AS embed_snap
+FROM thing
+WHERE ->part_of->thing = thing:article_crystallization
+ORDER BY pos ASC;
+
+-- Все места где используется блок
 SELECT <-references<-thing[WHERE mode IN ["live","snapshot"]].*
 FROM thing:block_protocol_3;
 
--- Снапшоты которые устарели (источник изменился после снапшота)
+-- Снапшоты с устаревшим содержимым
 SELECT * FROM references
   WHERE mode = "snapshot"
   AND ->thing.updated_at > snapshot_at;
 
--- Все блоки статьи по порядку (только верхний уровень)
-SELECT <-part_of<-thing[WHERE type != NONE].*,
-       <-part_of.order AS порядок
-FROM thing:article_crystallization
-ORDER BY порядок ASC;
+-- Все источники статьи
+SELECT ->references->thing[WHERE year != NONE].*
+FROM thing WHERE ->part_of->thing = thing:article_crystallization;
 
--- Рекурсивно весь документ с вложенными блоками
-SELECT <-part_of<-thing.* FROM thing:article_crystallization DEPTH 10;
-
--- Обновить снапшот
-UPDATE references SET
-  snapshot_text = (SELECT text FROM thing WHERE id = ->thing)[0].text,
-  snapshot_at = time::now()
-WHERE id = references:snap_table_results;
+-- Блоки одного уровня по порядку (для рендера раздела)
+SELECT *, ->part_of.order AS pos
+FROM thing WHERE ->part_of->thing = thing:section_methodology
+ORDER BY pos ASC;
 ```
 
 ---
