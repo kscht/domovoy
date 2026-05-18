@@ -5340,6 +5340,284 @@ FROM thing AS p, thing AS t
 WHERE p.kind = "пост" AND p->about->thing = t AND t.kind = "товар";
 ```
 
+## Сценарий: SMM-менеджер
+
+Аккаунты, посты, контент-план, кросс-постинг, согласование, аналитика —
+всё `thing`. Шлюзы и datasource для платформ уже в модели.
+
+### Аккаунты соцсетей
+
+```
+thing:acc_instagram
+  kind: аккаунт-соцсети
+  platform: instagram       ← instagram | vk | telegram | tiktok | youtube | pinterest
+  handle: "@moms_shop"
+  followers: 1240
+  → filed_with  → thing:platform_instagram   ← платформа как инстанция
+  → assigned_to → thing:mom
+  → can_access  ← thing:gateway_instagram    ← через какой шлюз публикуем
+
+thing:acc_telegram_channel
+  kind: аккаунт-соцсети
+  platform: telegram
+  handle: "@moms_garden_channel"
+  subscribers: 380
+  → can_access ← thing:gateway_telegram
+```
+
+### Пост
+
+```
+thing:post_smm_001
+  kind: smm-пост
+  caption: "🌱 Томаты Черри — собрала семена с лучших плодов. Ограниченный запас!"
+  status: идея              ← идея | черновик | на_согласовании | одобрен |
+                               запланирован | опубликован | архив
+  scheduled_at: 2026-05-20T10:00:00Z
+  published_at: datetime
+  platform_post_id: "17896..."   ← ID поста на платформе после публикации
+  → about      → thing:acc_instagram           ← в какой аккаунт
+  → about      → thing:listing_tomato_seeds    ← товар в посте (перелинковка)
+  → assigned_to → thing:mom
+  → produces   → thing:analytics_post_001
+```
+
+Медиафайлы поста — vault-файлы через `part_of` или `represents`:
+
+```
+thing:media_post_001_photo1  → part_of → thing:post_smm_001  (order: 1)
+thing:media_post_001_photo2  → part_of → thing:post_smm_001  (order: 2)
+```
+
+### Контент-план
+
+```
+thing:plan_may_2026
+  kind: контент-план
+  period: "2026-05"
+  → part_of → thing:smm_workspace
+
+-- Посты входят в план:
+thing:post_smm_001 → part_of → thing:plan_may_2026  (order: 3, planned_date: 2026-05-20)
+thing:post_smm_002 → part_of → thing:plan_may_2026  (order: 5, planned_date: 2026-05-22)
+```
+
+### Кросс-постинг и рерайт
+
+Одна идея — несколько адаптаций под разные платформы. Или блог-пост порождает SMM-посты:
+
+```mermaid
+graph TD
+    Idea[Контент-идея:\nВесенние семена томатов]
+    IG[SMM-пост Instagram\ncaption: короткий + эмодзи\nstatus: запланирован]
+    VK[SMM-пост ВКонтакте\ncaption: длинный текст\nstatus: черновик]
+    TG[SMM-пост Telegram\ncaption: с ссылкой на магазин]
+    Blog[Пост блога:\nКак сохранить семена томатов]
+
+    IG -->|part_of| Idea
+    VK -->|part_of| Idea
+    TG -->|part_of| Idea
+    Blog -->|produces| Idea
+```
+
+```
+thing:content_idea_spring_seeds
+  kind: контент-идея
+  brief: "Томаты Черри — новый урожай семян, ограниченное количество"
+
+thing:post_ig_001   → part_of → thing:content_idea_spring_seeds
+thing:post_vk_001   → part_of → thing:content_idea_spring_seeds
+thing:post_tg_001   → part_of → thing:content_idea_spring_seeds
+
+-- Блог-пост как источник:
+thing:post_blog_seeds → produces → thing:content_idea_spring_seeds
+```
+
+### Согласование с клиентом
+
+Пост переходит в статус `на_согласовании` → создаётся задача для клиента:
+
+```
+thing:post_smm_001
+  status: на_согласовании
+  → produces → thing:task_approve_smm_001
+
+thing:task_approve_smm_001
+  kind: задача
+  name: "Согласовать пост 20 мая"
+  deadline: 2026-05-18
+  → assigned_to → thing:client_ivanova
+  → about       → thing:post_smm_001
+```
+
+Клиент одобряет — `status: одобрен`. Отклоняет с комментарием — `status: черновик` +
+сообщение в обсуждении под постом.
+
+### Хэштеги
+
+Наборы хэштегов для разных тем — `thing` с массивом тегов:
+
+```
+thing:hashtags_garden
+  kind: набор-хэштегов
+  name: "Огород и сад"
+  tags: ["#огород", "#семена", "#дача", "#рассада", "#садовод", "#огородник"]
+
+thing:hashtags_crafts
+  kind: набор-хэштегов
+  name: "Рукоделие"
+  tags: ["#макраме", "#поделки", "#хэндмейд", "#ручнаяработа", "#braceletsofinstagram"]
+
+-- Пост использует набор:
+thing:post_smm_001 → requires → thing:hashtags_garden
+```
+
+### Аналитика постов
+
+```
+thing:analytics_post_001
+  kind: аналитика-поста
+  recorded_at: 2026-05-21T10:00:00Z   ← снапшот метрик
+  likes: 234
+  comments: 18
+  saves: 45
+  shares: 7
+  reach: 1240
+  impressions: 1890
+  clicks: 56                           ← клики по ссылке в bio
+  → about → thing:post_smm_001
+```
+
+Метрики снимаются расписанием через datasource платформы:
+
+```
+thing:ds_instagram_api
+  kind: источник-данных
+  type: rest
+  base_url: "https://graph.facebook.com/v18.0"
+  → can_access → thing:secret_instagram_token
+
+thing:schedule_pull_analytics
+  kind: расписание
+  cron: "0 9 * * *"           ← каждое утро обновлять метрики
+  → produces → thing:queue_analytics_pull
+```
+
+### Кампании
+
+```
+thing:campaign_spring_seeds
+  kind: smm-кампания
+  name: "Весенние семена 2026"
+  goal: "Продать 100 пакетов томатов до 1 июня"
+  budget: 3000                 ← рекламный бюджет
+  spent: 1200
+  start_date: 2026-04-15
+  end_date: 2026-05-31
+  → part_of → thing:smm_workspace
+
+-- Посты кампании:
+thing:post_smm_001 → part_of → thing:campaign_spring_seeds
+thing:post_smm_002 → part_of → thing:campaign_spring_seeds
+```
+
+### Link in bio
+
+```
+thing:linkinbio_moms
+  kind: link-in-bio
+  slug: "moms-garden"
+  → part_of    → thing:acc_instagram
+  → can_access ← thing:public
+
+thing:lb_item_shop   name: "🛍 Магазин"   order: 1  → about → thing:page_catalog
+thing:lb_item_seeds  name: "🌱 Семена"    order: 2  → about → thing:listing_tomato_seeds
+thing:lb_item_blog   name: "📝 Блог"      order: 3  → about → thing:blog_section
+thing:lb_item_tg     name: "📢 Telegram"  order: 4  url: "t.me/moms_garden_channel"
+
+-- Все part_of thing:linkinbio_moms
+```
+
+### Автопубликация через шлюз
+
+Когда `scheduled_at` наступает — `DEFINE EVENT` кладёт задание в очередь:
+
+```surql
+DEFINE EVENT auto_publish ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND $value.kind        = "smm-пост"
+    AND $value.status      = "запланирован"
+    AND $value.scheduled_at <= time::now()
+    AND $before.status     != "опубликован"
+  THEN {
+    CREATE thing SET kind = "задание", status = "ожидает",
+      payload_id = $value.id, created_at = time::now()
+    ;
+    RELATE $last->part_of->thing:queue_smm_publish;
+  };
+```
+
+Воркер берёт задание → вызывает модуль-шлюз (`gateway_instagram` / `gateway_vk` / `gateway_telegram`) → публикует → записывает `platform_post_id` + `published_at` + меняет `status: опубликован`.
+
+### Работа с несколькими клиентами (SMM-агентство)
+
+```
+thing:smm_workspace_ivanova
+  kind: smm-клиент
+  → about       → thing:business_ivanova_bakery
+  → assigned_to → thing:smm_manager_masha
+
+thing:plan_ivanova_may → part_of → thing:smm_workspace_ivanova
+thing:acc_ig_bakery    → part_of → thing:smm_workspace_ivanova
+```
+
+Доступ: `can_access[permissions: view, edit]` клиенту — только к своему workspace.
+
+### SurrealQL: рабочий дашборд SMM
+
+```surql
+-- Контент-план: что запланировано на неделю
+SELECT title, scheduled_at, status,
+       ->about->thing[WHERE kind = "аккаунт-соцсети"].platform AS платформа,
+       ->assigned_to->thing.name AS автор
+FROM thing
+WHERE kind = "smm-пост"
+  AND scheduled_at BETWEEN time::now() AND time::now() + 7d
+ORDER BY scheduled_at ASC;
+
+-- Посты ожидающие согласования
+SELECT caption[0..80] AS превью, scheduled_at,
+       ->about->thing[WHERE kind = "аккаунт-соцсети"].handle AS аккаунт,
+       ->produces->thing[WHERE kind = "задача"].assigned_to.name AS согласует
+FROM thing
+WHERE kind = "smm-пост" AND status = "на_согласовании"
+ORDER BY scheduled_at ASC;
+
+-- Топ постов по охвату за месяц
+SELECT ->about->thing.caption[0..60] AS пост,
+       reach, likes, saves,
+       math::round((saves / reach) * 100, 2) AS save_rate
+FROM thing
+WHERE kind = "аналитика-поста"
+  AND recorded_at > time::now() - 30d
+ORDER BY reach DESC LIMIT 10;
+
+-- Эффективность кампании
+SELECT name, goal, budget, spent,
+       count(<-part_of<-thing[WHERE kind = "smm-пост" AND status = "опубликован"]) AS постов,
+       math::sum(<-part_of<-thing->produces->thing[WHERE kind = "аналитика-поста"].reach)
+         AS суммарный_охват
+FROM thing
+WHERE kind = "smm-кампания" AND end_date > time::now() - 90d;
+
+-- Идеи без реализации (контент-идеи без ни одного поста)
+SELECT name, brief, created_at
+FROM thing
+WHERE kind = "контент-идея"
+  AND count(<-part_of<-thing[WHERE kind = "smm-пост"]) = 0
+ORDER BY created_at ASC;
+```
+
 ---
 
 ## Открытые вопросы
