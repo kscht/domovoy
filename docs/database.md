@@ -122,11 +122,13 @@ SELECT * FROM thing WHERE status = "в процессе" AND template != true;
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
 | `references` | Блок ссылается на другой блок с режимом включения | `mode`, `snapshot_text`, `snapshot_at` |
+| `identified_by` | Вещь идентифицируется этим кодом / маркировкой | `printed_at` |
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
 **`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
 **`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`  
-**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации
+**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации  
+**`printed_at` на ребре `identified_by`:** дата когда физическая наклейка была распечатана и наклеена; если отсутствует — код известен, но наклейка не печаталась
 
 ---
 
@@ -753,6 +755,9 @@ DEFINE TABLE references TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD mode          ON references TYPE string;
 DEFINE FIELD snapshot_text ON references TYPE option<string>;
 DEFINE FIELD snapshot_at   ON references TYPE option<datetime>;
+
+DEFINE TABLE identified_by TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD printed_at ON identified_by TYPE option<datetime>;
 ```
 
 ---
@@ -838,6 +843,9 @@ SELECT * FROM thing WHERE postponed_count > 2
       - платформа: текст           # для мессенджеров: Telegram / WhatsApp / Signal / ВКонтакте
       - метка: текст               # для контактов: личный / рабочий / домашний
       - предпочтительный: булево   # true = основной способ связи
+      - code_type: текст           # тип кода: ean13 / ean8 / qr / datamatrix / честный_знак / serial / imei / vin / isbn / rfid / custom_qr / ozon / wb / артикул
+      - code_value: текст          # значение кода: "4607082660271", "X1Y2Z3..."
+      - code_system: текст         # кто выдал: производитель / ozon / wb / wildberries / честный_знак / домовой
       - filename: текст            # для файловых узлов: имя файла на диске ("scan.pdf")
       - mime_type: текст           # для файловых узлов: "image/jpeg", "application/pdf"
       - size: число                # размер файла в байтах
@@ -990,6 +998,13 @@ SELECT * FROM thing WHERE postponed_count > 2
       - mode: текст           # live / snapshot / link
       - snapshot_text: текст  # для mode=snapshot: замороженный текст цели на момент фиксации
       - snapshot_at: дата     # когда был сделан снапшот
+
+  identified_by:
+    описание: вещь идентифицируется этим кодом или маркировкой
+    от: thing   # физическая вещь
+    к: thing    # код / маркировка
+    поля:
+      - printed_at: дата   # когда наклейка физически распечатана; null = код известен, наклейки нет
 ```
 
 ---
@@ -2276,6 +2291,127 @@ SELECT ->about<-thing[WHERE ->part_of->thing != NONE].* FROM thing:milk
 -- Задачи созданные из писем / сканов
 SELECT * FROM thing WHERE status != "выполнено"
   AND ->about->thing[WHERE type IN ["photo","scan"]] != NONE;
+```
+
+---
+
+## Сценарий: маркировка физических вещей
+
+Каждый код — отдельный `thing`-узел с `code_type`, `code_value`, `code_system`.
+Физическая вещь связана со своими кодами через `identified_by`.
+Одна вещь — сколько угодно кодов разных систем.
+
+### Типы кодов
+
+| `code_type` | Описание | Пример `code_value` |
+|-------------|----------|---------------------|
+| `ean13` | Штрихкод производителя | `4607082660271` |
+| `ean8` | Короткий штрихкод | `12345678` |
+| `qr` | QR-код производителя или магазина | URL или строка |
+| `datamatrix` | 2D код (часто на лекарствах) | строка |
+| `честный_знак` | Российская маркировка | `010460...` |
+| `serial` | Серийный номер | `SN-2024-A1B2C3` |
+| `imei` | Идентификатор телефона | `359876543210001` |
+| `vin` | Идентификатор автомобиля | `XTA21099063185829` |
+| `isbn` | Книжный идентификатор | `978-5-17-090965-3` |
+| `rfid` | Радио-метка | hex-строка |
+| `ozon` | Штрихкод посылки Ozon | строка |
+| `wb` | Штрихкод посылки WB | строка |
+| `артикул` | Артикул магазина / поставщика | `BOX-2024-BLK-L` |
+| `custom_qr` | Собственная наклейка Домового | `domovoy://thing/drill_bosch` |
+
+### Пример: дрель с несколькими кодами
+
+```mermaid
+graph TD
+    Drill[Дрель Bosch GSB 21-2 RE\nkind: физическое]
+
+    EAN[EAN-13: 3165140462037\ncode_system: производитель]
+    Serial[Серийный: 2024-EU-447821\ncode_system: производитель]
+    OzonBox[Ozon посылка: 84291043\ncode_system: ozon]
+    Custom[custom_qr: domovoy://thing/drill_bosch\ncode_system: домовой\nprinted_at: 18 мая 2026]
+
+    Drill -->|identified_by| EAN
+    Drill -->|identified_by| Serial
+    Drill -->|identified_by, printed_at: null| OzonBox
+    Drill -->|identified_by, printed_at: 18 мая| Custom
+```
+
+`OzonBox` — код с коробки заказа. `printed_at: null` — наклейка не печаталась, код просто
+занесён в систему при получении посылки. `Custom` — собственная наклейка распечатана
+и наклеена на дрель.
+
+### Ozon / WB: от кода коробки до заказа
+
+Код на коробке Ozon идентифицирует **посылку**, не товар. Посылка `part_of` заказа.
+
+```mermaid
+graph TD
+    Box[Ozon посылка 84291043\ncode_system: ozon]
+    Order[Заказ Ozon #89234\nstatus: получено\ndate: 15 мая]
+    Drill[Дрель Bosch GSB 21-2 RE]
+    Receipt[Чек / накладная Ozon]
+
+    Drill -->|identified_by| Box
+    Order -->|produces| Drill
+    Order -->|produces| Receipt
+    Box -->|about| Order
+```
+
+Сканируешь штрихкод с коробки → находишь `Box` в графе → через `about` выходишь
+на заказ → там накладная, дата, цена, гарантийный период.
+
+### Собственная маркировка Домового
+
+Custom QR кодирует ID узла напрямую: `domovoy://thing/{id}`.
+При сканировании приложение открывает узел без запроса к БД — схема распознаётся немедленно.
+
+`printed_at` на ребре `identified_by` фиксирует дату печати наклейки. По этому полю
+можно найти все вещи у которых наклейка уже есть, и те которые ещё нужно промаркировать.
+
+### Честный знак и лекарства
+
+```
+thing:code_chestnyznak_medicine
+  code_type: честный_знак
+  code_value: "010460..."
+  code_system: честный_знак
+  url: "https://честныйзнак.рф/..."    ← ссылка на верификацию
+
+thing:medicine_amoxicillin
+  → identified_by → thing:code_chestnyznak_medicine
+  → identified_by → thing:code_ean_medicine
+```
+
+Поле `url` на коде — ссылка на страницу верификации. Из приложения — один клик
+для проверки подлинности.
+
+```surql
+-- Найти вещь по любому коду (сканирование)
+SELECT <-identified_by<-thing
+FROM thing WHERE code_value = $scanned_value;
+
+-- Все коды конкретной вещи
+SELECT ->identified_by->thing.*
+FROM thing:drill_bosch;
+
+-- Вещи без собственной наклейки (custom_qr не наклеен)
+SELECT * FROM thing WHERE kind = "физическое"
+  AND ->identified_by->thing[WHERE code_type = "custom_qr"
+    AND <-identified_by.printed_at != NONE] IS EMPTY;
+
+-- Вещи которые нужно промаркировать (есть в системе, наклейки нет)
+SELECT name FROM thing WHERE kind = "физическое"
+  AND NOT (->identified_by->thing[WHERE code_type = "custom_qr"] != NONE);
+
+-- От штрихкода посылки до заказа и чека
+SELECT ->about->thing AS заказ,
+       ->about->thing->produces->thing[WHERE filename != NONE] AS документы
+FROM thing WHERE code_value = "84291043" AND code_system = "ozon";
+
+-- Все лекарства с Честным знаком (для проверки сроков)
+SELECT <-identified_by<-thing.*
+FROM thing WHERE code_type = "честный_знак";
 ```
 
 ---
