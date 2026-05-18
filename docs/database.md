@@ -758,7 +758,42 @@ DEFINE FIELD snapshot_at   ON references TYPE option<datetime>;
 
 DEFINE TABLE identified_by TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD printed_at ON identified_by TYPE option<datetime>;
+
+DEFINE TABLE promised_to TYPE RELATION FROM thing TO thing;
+
+-- Поле params на requires: для передачи конфигурации модулю/рантайму
+DEFINE FIELD params ON requires TYPE option<object>;
 ```
+
+### Индексы
+
+```surql
+-- Основные фильтры по узлам
+DEFINE INDEX idx_kind        ON thing FIELDS kind;
+DEFINE INDEX idx_status      ON thing FIELDS status;
+DEFINE INDEX idx_kind_status ON thing FIELDS kind, status;
+DEFINE INDEX idx_template    ON thing FIELDS template;
+DEFINE INDEX idx_language    ON thing FIELDS language;
+
+-- Полнотекстовый поиск
+DEFINE INDEX idx_name ON thing FIELDS name
+  SEARCH ANALYZER ascii BM25;
+DEFINE INDEX idx_text ON thing FIELDS text
+  SEARCH ANALYZER ascii BM25;
+DEFINE INDEX idx_description ON thing FIELDS description
+  SEARCH ANALYZER ascii BM25;
+
+-- Векторный поиск (изображения и текстовые эмбеддинги, 1536-мерный OpenAI / 768 local)
+DEFINE INDEX idx_embedding ON thing FIELDS embedding
+  MTREE DIMENSION 1536;
+
+-- Очереди и задания (для оркестрации)
+DEFINE INDEX idx_queue_status ON thing FIELDS kind, status, priority;
+```
+
+Единая таблица `thing` с индексами эффективна при типичном масштабе семейной системы
+(десятки тысяч записей). Разбивать `thing` на отдельные таблицы по типу (`task`, `person`,
+`document`) стоит только если один `kind` вырастет за ~100 000 записей.
 
 ---
 
