@@ -8416,24 +8416,46 @@ contains (in: кладовка, out: ваза) started_at = now()
 
 ### kind: хранилище-файлов
 
+MinIO — рекомендуемый primary-бэкенд: S3-совместимый API, self-hosted, работает на одной машине и в кластере без изменений кода. Переключение на настоящий S3 или Backblaze B2 — смена одной строки endpoint.
+
 ```yaml
+# Primary — MinIO (self-hosted, рекомендуется)
 kind: хранилище-файлов
-name: "Локальный NAS"
-subtype: local          # local | s3 | minio | backblaze-b2 | nextcloud | sftp | webdav
-url: "/mnt/nas/domovoy"
+name: "MinIO home"
+subtype: minio
+endpoint: "http://minio.home:9000"
+bucket: "domovoy"
+access_key: "..."           # хранится в vault, не в графе
 is_primary: true
 is_cdn: false
 quota_bytes: 107374182400   # 100 GB
 
-# или облачный бэкенд
+# Резервный — Backblaze B2 (облако, S3-совместимый)
 kind: хранилище-файлов
-name: "Backblaze B2"
+name: "Backblaze B2 backup"
 subtype: backblaze-b2
-url: "s3://domovoy-backup"
+endpoint: "https://s3.us-west-004.backblazeb2.com"
+bucket: "domovoy-backup"
 is_primary: false
 is_cdn: true
 cdn_url: "https://files.example.com"
+
+# Только для разработки — локальная папка
+kind: хранилище-файлов
+name: "Local dev"
+subtype: local
+path: "/tmp/domovoy-dev"
+is_primary: false
 ```
+
+| subtype | когда использовать |
+|---------|-------------------|
+| `minio` | **primary** — self-hosted, S3 API, домашний сервер / NAS |
+| `s3` | production в облаке, AWS |
+| `backblaze-b2` | дешёвый резервный бэкенд |
+| `nextcloud` | если уже есть Nextcloud |
+| `sftp` | legacy NAS без S3 |
+| `local` | только для разработки |
 
 ### kind: файл
 
