@@ -23,6 +23,7 @@
 | Задача / обращение | `status`, `deadline`, `priority` |
 | Периодический платёж | `amount`, `period`, `due_day`, `paid_until` |
 | Человек | `role` (папа, мама, сын, дочь, бабушка) |
+| Физическая/цифровая вещь | `kind` (физическое / цифровое / смешанное) |
 
 **`status`:** `не начато` / `в процессе` / `выполнено` / `ожидает` / `отменено`  
 **`period`:** `ежедневно` / `еженедельно` / `ежемесячно` / `ежеквартально` / `ежегодно`
@@ -43,6 +44,8 @@
 | `requires` | Плановый расход (шаблон → ингредиент/деталь) | `quantity`, `unit` |
 | `produces` | Результат выполнения (решение, документ, блюдо) | — |
 | `used` | Фактический расход при запуске | `quantity`, `unit` |
+| `represents` | Цифровая копия → физический оригинал | — |
+| `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`
@@ -70,6 +73,87 @@ graph TD
 - `assigned_to` → конкретный человек: личная ответственность
 - `assigned_to` → несколько людей: совместная
 - `assigned_to` → Семья: открытая задача, берёт кто свободен
+
+---
+
+## Физическое и цифровое
+
+Физическая вещь отвечает на вопрос **где находится** → `contains`.  
+Цифровая вещь отвечает на вопрос **кто имеет доступ** → `can_access`.  
+Связь между ними — `represents`.
+
+Поле `kind`: `физическое` / `цифровое` / `смешанное`.
+
+```mermaid
+graph TD
+    Drawer[Ящик стола]
+    CD[CD-диск со снимками\nkind: физическое]
+    DocPhysical[Направление от врача\nkind: физическое]
+
+    XrayFiles[Снимки рентгена\nkind: цифровое]
+    DocScan[Скан направления\nkind: цифровое]
+
+    ShareDoctor[Подборка для Петрова]
+    Doctor[Доктор Петров]
+
+    CD -->|contains| Drawer
+    DocPhysical -->|contains| Drawer
+
+    XrayFiles -->|represents| CD
+    DocScan -->|represents| DocPhysical
+
+    XrayFiles -->|part_of| ShareDoctor
+    DocScan -->|part_of| ShareDoctor
+    Doctor -->|can_access| ShareDoctor
+```
+
+- Диск физически лежит в ящике, врач его не трогает
+- Врач получает `can_access` только к цифровым копиям
+- Один физический оригинал может иметь несколько цифровых представлений (скан, фото, PDF)
+
+---
+
+## Доступ и шаринг
+
+`can_access` работает напрямую на конкретные вещи — без глобальных пространств.  
+**Каскад:** доступ к вещи автоматически даёт доступ ко всему `part_of` неё вглубь.
+
+```mermaid
+graph TD
+    Dad[Папа]
+    Mom[Мама]
+    Alexey[Алексей\nюрпомощник]
+    Doctor[Доктор Петров]
+
+    ShareLegal[Подборка для Алексея]
+    ShareMed[Снимки для Петрова]
+
+    Case1[Дело о заборе]
+    Case3[Дело о земле]
+    Xray[Снимки рентгена]
+    Mri[МРТ колена]
+
+    PersonalMom[Личные задачи мамы]
+    Task1[Записаться к косметологу]
+    Task2[Продлить абонемент]
+
+    Case1 -->|part_of| ShareLegal
+    Case3 -->|part_of| ShareLegal
+    Xray -->|part_of| ShareMed
+    Mri -->|part_of| ShareMed
+    Task1 -->|part_of| PersonalMom
+    Task2 -->|part_of| PersonalMom
+
+    Alexey -->|can_access| ShareLegal
+    Doctor -->|can_access| ShareMed
+    Mom -->|can_access| PersonalMom
+    Dad -->|can_access| Case1
+    Dad -->|can_access| Case3
+```
+
+**Шаблон доступа** — заранее созданный контейнер с типовым набором.  
+Пример: "Доступ врача" — контейнер с нужными цифровыми копиями,  
+врачу выдаётся `can_access` к этому контейнеру и ничего лишнего.
 
 ---
 
@@ -242,6 +326,10 @@ DEFINE TABLE used TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD quantity ON used TYPE option<number>;
 DEFINE FIELD unit     ON used TYPE option<string>;
 
+DEFINE TABLE represents TYPE RELATION FROM thing TO thing;
+
+DEFINE TABLE can_access TYPE RELATION FROM thing TO thing;
+
 DEFINE TABLE related_to TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD label ON related_to TYPE string;
 ```
@@ -358,6 +446,16 @@ SELECT * FROM thing
     поля:
       - quantity: число
       - unit: текст
+  represents:
+    описание: цифровая копия → физический оригинал
+    от: thing   # цифровое
+    к: thing    # физическое
+
+  can_access:
+    описание: кто имеет доступ к цифровой вещи или контейнеру
+    от: thing   # человек или группа
+    к: thing    # цифровая вещь или контейнер
+
   related_to:
     описание: произвольная связь
     от: thing
