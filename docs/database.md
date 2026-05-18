@@ -8402,6 +8402,253 @@ contains (in: кладовка, out: ваза) started_at = now()
 
 ---
 
+## Файлы, медиа и бинарные данные
+
+Бинарные данные никогда не хранятся в SurrealDB — только метаданные. Файлы живут в отдельном хранилище; граф содержит указатели, производные варианты и извлечённый контент.
+
+### Новые виды узлов
+
+| kind | что это |
+|------|---------|
+| `файл` | метаданные файла: тип, размер, checksum, где лежит, варианты |
+| `чанк` | фрагмент текста из файла с embedding для RAG |
+| `хранилище-файлов` | конфигурация storage-бэкенда |
+
+### kind: хранилище-файлов
+
+```yaml
+kind: хранилище-файлов
+name: "Локальный NAS"
+subtype: local          # local | s3 | minio | backblaze-b2 | nextcloud | sftp | webdav
+url: "/mnt/nas/domovoy"
+is_primary: true
+is_cdn: false
+quota_bytes: 107374182400   # 100 GB
+
+# или облачный бэкенд
+kind: хранилище-файлов
+name: "Backblaze B2"
+subtype: backblaze-b2
+url: "s3://domovoy-backup"
+is_primary: false
+is_cdn: true
+cdn_url: "https://files.example.com"
+```
+
+### kind: файл
+
+```yaml
+kind: файл
+name: "Договор аренды 2024.pdf"
+mime_type: "application/pdf"
+size_bytes: 1240320
+checksum_sha256: "a3f1b2c4..."
+original_filename: "contract_rent_2024.pdf"
+uploaded_at: datetime
+uploaded_by: thing:user_me
+
+# где физически лежит (несколько бэкендов для надёжности)
+storage_locations:
+  - backend: thing:storage_local
+    path: "a3/a3f1b2c4/original.pdf"
+    verified_at: datetime
+  - backend: thing:storage_b2
+    key: "files/a3f1b2c4/original.pdf"
+    verified_at: datetime
+
+# производные варианты (ссылки на дочерние kind: файл)
+variants:
+  thumbnail: thing:file_a3f1_thumb    # первая страница, 200×200
+  preview:   thing:file_a3f1_prev     # первая страница, 800px
+
+# для изображений
+width_px: ~
+height_px: ~
+exif: {}
+
+# для аудио/видео
+duration_sec: ~
+codec: ~
+
+# статус обработки воркером
+processing_status: "готов" | "обрабатывается" | "ошибка"
+
+# рёбра
+about: thing:doc_lease_agreement   # к чему относится
+represents: thing:doc_original     # физический оригинал (если скан)
+part_of: thing:file_a3f1_original  # если это производный вариант
+```
+
+### Детерминированный путь в хранилище
+
+```
+{storage_root}/{checksum[0:2]}/{checksum}/original.{ext}
+{storage_root}/{checksum[0:2]}/{checksum}/thumbnail.webp
+{storage_root}/{checksum[0:2]}/{checksum}/preview.webp
+{storage_root}/{checksum[0:2]}/{checksum}/page_{n}.webp
+```
+
+Путь выводится из checksum — дедупликация автоматическая. Два пользователя загрузили одинаковый файл → один физический объект на диске, два `kind: файл` узла в графе с разными `about`.
+
+### kind: чанк (для RAG и полнотекстового поиска)
+
+Воркер разбивает текстовые файлы (PDF, DOCX, TXT, MD) на чанки и вычисляет embeddings:
+
+```yaml
+kind: чанк
+text: "Арендатор обязан вносить плату не позднее 5-го числа..."
+page: 3
+chunk_index: 7
+token_count: 128
+embedding: [0.12, -0.34, 0.87, ...]   # 1536-мерный вектор, MTREE-индекс
+language: "ru"
+part_of: thing:file_a3f1b2c4          # из какого файла
+about: thing:doc_lease_agreement       # наследует контекст
+```
+
+Существующий индекс покрывает чанки без изменений:
+```surql
+DEFINE INDEX idx_embedding ON thing FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX idx_text      ON thing FIELDS text SEARCH ANALYZER ascii BM25;
+```
+
+### Пайплайн обработки файла
+
+```mermaid
+graph LR
+    Upload["Загрузка файла\n(multipart/form-data)"]
+    AppSrv["App Server\n(Next.js API)"]
+    Storage["Хранилище\n(local / S3)"]
+    DB["SurrealDB\nkind: файл"]
+    Queue["kind: очередь\nfile-processing"]
+    Worker["kind: воркер\nfile-processor"]
+    Thumb["kind: файл\nthumbnail"]
+    Chunks["kind: чанк\n×N"]
+    Idx["Поиск\n(BM25 + MTREE)"]
+
+    Upload --> AppSrv
+    AppSrv -->|stream| Storage
+    AppSrv -->|метаданные| DB
+    DB -->|DEFINE EVENT| Queue
+    Queue --> Worker
+    Worker -->|generate| Thumb
+    Worker -->|extract + split| Chunks
+    Chunks --> Idx
+```
+
+```surql
+-- DEFINE EVENT: запустить обработку при создании файла
+DEFINE EVENT process_file ON TABLE thing
+  WHEN $event = "CREATE" AND $after.kind = "файл"
+    AND $after.processing_status = NONE
+THEN {
+  UPDATE $after.id SET processing_status = "обрабатывается";
+  CREATE thing SET
+    kind     = "запуск-плейбука",
+    status   = "ожидание",
+    part_of  = thing:playbook_process_file,
+    context  = { trigger: $after };
+};
+```
+
+### Варианты по типу файла
+
+| mime_type | варианты | чанки |
+|-----------|---------|-------|
+| `image/*` | thumbnail, preview | нет (только EXIF) |
+| `application/pdf` | thumbnail, preview, page\_N | да (по страницам) |
+| `text/*`, `*.md` | нет | да |
+| `application/msword` | thumbnail | да |
+| `audio/*` | waveform | да (транскрипт через STT) |
+| `video/*` | keyframes, thumbnail | да (транскрипт через STT) |
+
+Для аудио и видео транскрипт создаётся через STT-модуль (`kind: источник-данных`, subtype: whisper-local) и разбивается на чанки.
+
+### Доступ к файлам
+
+Права наследуются от `about`: есть `can_access` на thing → есть доступ ко всем его файлам. Явные права на конкретный файл через `can_access` переопределяют.
+
+```surql
+-- Проверить доступ к файлу
+SELECT id FROM thing
+WHERE id = $file_id
+  AND (
+    -- явный доступ к файлу
+    <-can_access<-thing[WHERE id = $auth AND status = "active"] != []
+    -- или доступ к тому, о чём файл
+    OR ->about->thing<-can_access<-thing[WHERE id = $auth AND status = "active"] != []
+    -- или публичный
+    OR <-can_access<-thing[WHERE id = thing:public] != []
+  );
+```
+
+Раздача файлов через Next.js API route (проверка доступа) или прямой CDN URL для публичных.
+
+### Квоты и дедупликация
+
+```surql
+-- Место, занятое пользователем
+SELECT math::sum(size_bytes) AS использовано,
+       count() AS файлов
+FROM thing
+WHERE kind = "файл" AND uploaded_by = $auth;
+
+-- Дедупликация: найти дубли по checksum
+SELECT checksum_sha256, count() AS копий,
+       array::group(uploaded_by.name) AS у_кого
+FROM thing
+WHERE kind = "файл"
+GROUP BY checksum_sha256
+HAVING копий > 1;
+```
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Все файлы, связанные с узлом (и его дочерними)
+SELECT name, mime_type, size_bytes, uploaded_at,
+       uploaded_by.name AS кто,
+       variants.thumbnail AS превью
+FROM thing
+WHERE kind = "файл"
+  AND (about = $node_id
+    OR about->part_of->thing = $node_id)
+ORDER BY uploaded_at DESC;
+
+-- Семантический поиск по чанкам (vector search)
+SELECT text, page,
+       part_of.name AS файл,
+       about.name AS контекст,
+       vector::similarity::cosine(embedding, $query_embedding) AS score
+FROM thing
+WHERE kind = "чанк"
+ORDER BY score DESC LIMIT 10;
+
+-- Файлы без обработки (застряли в очереди)
+SELECT name, mime_type, uploaded_at, processing_status
+FROM thing
+WHERE kind = "файл"
+  AND processing_status = "обрабатывается"
+  AND uploaded_at < time::now() - 10m;
+
+-- Самые большие файлы в системе
+SELECT name, mime_type,
+       math::round(size_bytes / 1048576) AS мб,
+       uploaded_by.name AS кто,
+       about.name AS контекст
+FROM thing
+WHERE kind = "файл" AND part_of = NONE   -- только оригиналы, не варианты
+ORDER BY size_bytes DESC LIMIT 20;
+
+-- Файлы, у которых нет бэкапа во втором хранилище
+SELECT name, size_bytes, storage_locations
+FROM thing
+WHERE kind = "файл"
+  AND array::len(storage_locations) < 2;
+```
+
+---
+
 ## Открытые вопросы
 
 - [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
