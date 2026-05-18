@@ -7217,6 +7217,229 @@ WHERE locked_by = $auth;
 
 ---
 
+## UI-слой
+
+Ключевой принцип: **не создавай UI для каждой фичи — создай UI для графа**. Все экраны приложения — это один generic-рендерер плюс view-определения, хранящиеся в самом графе.
+
+### Три уровня
+
+```
+Граф (данные)          — SurrealDB: thing + edges
+Виды (что показывать)  — тоже в SurrealDB: kind: вид
+Рендерер (как)         — generic React-компоненты, читают виды из графа
+```
+
+Добавить поддержку нового `kind` в UI = создать узел `kind: вид`. Код не трогаешь.
+
+### Новые виды узлов
+
+| kind | что это |
+|------|---------|
+| `вид` | описание того, как рендерить конкретный kind |
+| `умный-список` | сохранённый SurrealQL-запрос как навигационный экран |
+| `рабочее-пространство` | персональная сборка из списков, дашбордов и пинов |
+| `действие` | доступная операция для kind (complete, delegate, split…) |
+
+### kind: вид
+
+Определяет рендеринг конкретного `kind` в трёх режимах: карточка в списке, полная страница, inline внутри родителя.
+
+```yaml
+kind: вид
+for_kind: "задача"
+modes:
+  card:
+    fields: [name, status, due_date]
+    badge: status
+    color_by: priority
+  detail:
+    fields: [name, status, due_date, description, energy, context]
+    edges:
+      - depends_on:   "Блокируется"
+      - part_of:      "Проект"
+      - assigned_to:  "Исполнитель"
+      - about:        "О чём"
+      - produces:     "Результат"
+    sections:
+      - kind: умный-список   # подзадачи
+        query: "SELECT * FROM thing WHERE ->part_of->thing = $id"
+  inline:
+    fields: [name, status]
+    compact: true
+actions:
+  - name: "Выполнить"
+    sets: { status: "выполнена" }
+  - name: "Делегировать"
+    opens: "assigned_to"
+  - name: "Разбить"
+    creates: { kind: "задача", part_of: "$id" }
+```
+
+```surql
+-- Создать вид для задачи
+CREATE thing SET
+  kind = "вид",
+  for_kind = "задача",
+  modes = { ... },
+  actions = [ ... ];
+
+-- Получить вид для рендеринга
+SELECT * FROM thing WHERE kind = "вид" AND for_kind = $target_kind;
+```
+
+### Три режима рендеринга
+
+Один generic React-компонент на каждый режим. Kind-специфичные компоненты — только для сложных UX (Kanban, граф, чат).
+
+```
+card    — карточка в списке
+         название, статус, пара полей, badge
+         клик → открывает detail
+
+detail  — полная страница
+         все поля из вида, все рёбра как секции
+         история изменений, actions
+
+inline  — встроен в контекст родителя
+         подзадача внутри задачи, сообщение внутри чата
+         компактно, без переходов
+```
+
+```mermaid
+graph LR
+    Thing["thing (данные)"]
+    View["kind: вид\nfor_kind: задача"]
+    Renderer["Generic Renderer\n(React)"]
+    Card["Card mode"]
+    Detail["Detail mode"]
+    Inline["Inline mode"]
+
+    Thing -->|данные| Renderer
+    View -->|layout + fields + actions| Renderer
+    Renderer --> Card
+    Renderer --> Detail
+    Renderer --> Inline
+```
+
+### kind: умный-список
+
+Все «экраны» приложения — умные списки. Inbox, сегодня, мои задачи, истекающие сертификаты — один компонент `<SmartList>`, разные SurrealQL-запросы.
+
+```yaml
+kind: умный-список
+name: "Сегодня"
+query: >
+  SELECT * FROM thing
+  WHERE status != "выполнена"
+    AND (due_date < time::now() + 1d OR due_date = NONE)
+    AND ->assigned_to->thing = $auth
+ORDER BY priority DESC, due_date ASC
+view_mode: "card"      # как рендерить элементы списка
+group_by: "kind"       # опциональная группировка
+```
+
+```yaml
+kind: умный-список
+name: "Истекающие сертификаты"
+query: >
+  SELECT * FROM thing
+  WHERE kind = "сертификат"
+    AND expires_at < time::now() + 30d
+ORDER BY expires_at ASC
+view_mode: "card"
+```
+
+```yaml
+kind: умный-список
+name: "Инфраструктура — открытые инциденты"
+query: >
+  SELECT * FROM thing
+  WHERE kind = "инцидент" AND status = "открыт"
+    AND ->about->thing->part_of->thing->part_of->thing IN (
+      SELECT id FROM thing WHERE kind = "сайт"
+    )
+ORDER BY started_at DESC
+view_mode: "list-row"
+```
+
+Умные списки — это те же `thing`-узлы: шарятся через `can_access`, пинятся в рабочее пространство, встраиваются в дашборды как виджеты с `chart_type: table`.
+
+### kind: рабочее-пространство
+
+Персональная сборка: навигация слева, дашборд сверху, пины на часто используемые узлы.
+
+```yaml
+kind: рабочее-пространство
+name: "Моя главная"
+owner: thing:user_me
+sidebar:
+  - thing:list_today          # умный-список "Сегодня"
+  - thing:list_inbox          # умный-список "Входящие"
+  - thing:list_infra_alerts   # умный-список "Алерты"
+dashboard: thing:dashboard_home
+pinned:
+  - thing:project_home_repair
+  - thing:site_home_network
+  - thing:chat_ai_devops
+```
+
+У каждого члена семьи — своё рабочее пространство. Общие умные списки шарятся через `can_access`.
+
+### Навигация = граф
+
+Основной способ навигации — следование по рёбрам. Кликнул на `assigned_to` → открылся профиль пользователя. Кликнул на `part_of` → открылся проект. Кликнул на `about` → открылся сервер.
+
+Хлебные крошки формируются из пути по графу, а не из URL-иерархии.
+
+```
+Инциденты → Proxmox недоступен → О: сервер Proxmox-home → Сервисы → Nextcloud
+```
+
+### Kanban, Calendar, Graph — специализированные виды
+
+Для часто используемых сценариев — специализированные React-компоненты поверх той же модели данных:
+
+| Компонент | Источник данных |
+|-----------|----------------|
+| `<Kanban>` | умный-список, сгруппированный по `status` |
+| `<Calendar>` | умный-список с полем `due_date` или `started_at` |
+| `<GraphView>` | SurrealQL-запрос с рёбрами, рендер через D3 / Cytoscape |
+| `<Chat>` | `kind: чат` + `kind: сообщение` через `part_of` |
+| `<Dashboard>` | `kind: дашборд` + `kind: виджет` |
+
+Каждый компонент — это просто другой способ отрендерить тот же набор `thing`-узлов.
+
+### SurrealQL: запросы для UI
+
+```surql
+-- Получить вид для kind
+SELECT * FROM thing WHERE kind = "вид" AND for_kind = $target_kind LIMIT 1;
+
+-- Умные списки текущего пользователя (свои + расшаренные)
+SELECT name, query, view_mode, group_by
+FROM thing
+WHERE kind = "умный-список"
+  AND (<-can_access<-thing = $auth OR <-can_access<-thing = thing:public);
+
+-- Рабочее пространство пользователя
+SELECT *, sidebar.{ name, kind, query } AS nav,
+       dashboard.{ name } AS доска
+FROM thing
+WHERE kind = "рабочее-пространство" AND owner = $auth
+LIMIT 1;
+
+-- Breadcrumb: путь от узла до корня через part_of
+SELECT id, name, kind FROM thing
+WHERE id = $node_id
+  FETCH ->part_of->thing, ->part_of->thing->part_of->thing;
+
+-- Все доступные действия для kind
+SELECT actions FROM thing
+WHERE kind = "вид" AND for_kind = $target_kind;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
