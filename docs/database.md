@@ -26,6 +26,7 @@
 | Человек | `role` (папа, мама, сын, дочь, бабушка) |
 | Физическая/цифровая вещь | `kind` (физическое / цифровое / смешанное) |
 | Сообщение | `text`, `created_at` |
+| Событие / мероприятие | `date`, `duration` |
 
 **`status` задачи:** `не начато` / `в процессе` / `выполнено` / `ожидает` / `на паузе` / `отменено`  
 **`status` обещания:** `ожидается` / `выполнено` / `нарушено`  
@@ -49,6 +50,7 @@
 | `produces` | Результат выполнения (решение, документ, блюдо) | — |
 | `used` | Фактический расход при запуске | `quantity`, `unit` |
 | `participant` | Участник с ролью (организатор, посредник, информирован…) | `role` |
+| `located_at` | Где происходит событие или мероприятие | — |
 | `promised_to` | Кому дано обещание | — |
 | `represents` | Цифровая копия → физический оригинал | — |
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
@@ -162,6 +164,116 @@ graph TD
 **Шаблон доступа** — заранее созданный контейнер с типовым набором.  
 Пример: "Доступ врача" — контейнер с нужными цифровыми копиями,  
 врачу выдаётся `can_access` к этому контейнеру и ничего лишнего.
+
+---
+
+## Сценарий: планирование мероприятий
+
+Мероприятие — `thing` с датой. Место через `located_at`, участники через `participant`,
+ресурсы через `requires`, подзадачи через `part_of`. Нехватка ресурсов → список покупок.
+
+```mermaid
+graph TD
+    Party[День рождения сына\ndate: 15 июня\nstatus: не начато]
+    Venue[Парк Горького]
+    Dad[Папа]
+    Son[Сын]
+    Alex[Алексей]
+    Misha[Михаил]
+
+    Cake[Торт\nquantity: 0шт]
+    Balloons[Шарики\nquantity: 3шт]
+    ShoppingList[Список покупок]
+
+    T1[Отправить приглашения\ndeadline: 1 июня]
+    T2[Заказать торт\ndeadline: 10 июня]
+    T3[Украсить место\ndeadline: 15 июня]
+
+    Party -->|located_at| Venue
+    Party -->|assigned_to| Dad
+    Party -->|participant, role: именинник| Son
+    Party -->|participant, role: гость| Alex
+    Party -->|participant, role: гость| Misha
+    Party -->|requires qty:1| Cake
+    Party -->|requires qty:20| Balloons
+
+    Cake -->|quantity=0, нужно купить| ShoppingList
+    ShoppingList -->|needs qty:1| Cake
+    ShoppingList -->|needs qty:17| Balloons
+
+    T1 -->|part_of| Party
+    T2 -->|part_of| Party
+    T3 -->|part_of| Party
+    T2 -->|about| Cake
+```
+
+---
+
+## Сценарий: журналистика и описание событий
+
+Событие — `thing` с датой и местом. Статья/репортаж `about` событие, `produces` публикацию.
+Источники — через `related_to, label: "источник"`. Свидетели — через `participant`.
+
+```mermaid
+graph TD
+    Event[Событие: пожар на заводе\ndate: 12 мая 14:30]
+    Factory[Завод №5\nул. Промышленная 7]
+    Journalist[Журналист Петров]
+    Witness[Свидетель Иванов]
+    Photo[Фотографии с места\nkind: цифровое]
+    FireReport[Официальный отчёт МЧС\nkind: цифровое]
+
+    Draft[Черновик репортажа]
+    Article[Репортаж: пожар на заводе\nопубликован: 13 мая]
+
+    Event -->|located_at| Factory
+    Event -->|participant, role: свидетель| Witness
+
+    Draft -->|about| Event
+    Draft -->|assigned_to| Journalist
+    Draft -->|participant, role: свидетель| Witness
+    Draft -->|related_to, label: источник| Photo
+    Draft -->|related_to, label: источник| FireReport
+    Draft -->|produces| Article
+
+    Photo -->|about| Event
+    FireReport -->|about| Event
+```
+
+**Журналистский цикл:**
+```mermaid
+graph LR
+    A[Событие происходит] -->|produces| B[Полевые заметки / фото]
+    B -->|about| C[Черновик]
+    C -->|produces| D[Опубликованная статья]
+    D -->|about| E[Следующее событие\nреакция, расследование]
+    E -->|about| C2[Новый черновик...]
+```
+
+```surql
+-- Все события в определённом месте
+SELECT <-located_at<-thing.* FROM thing:factory_5;
+
+-- Все материалы по событию (статьи, фото, заметки)
+SELECT <-about<-thing.* FROM thing:event_fire_may12;
+
+-- Участники мероприятия с их ролями
+SELECT ->participant->thing.name AS person, ->participant.role AS role
+FROM thing:party_birthday;
+
+-- Что нужно купить для мероприятия
+SELECT ->requires->thing.name AS item,
+       ->requires.quantity AS нужно,
+       ->requires->thing.quantity AS есть
+FROM thing:party_birthday
+WHERE ->requires->thing.quantity < ->requires.quantity;
+
+-- Ближайшие мероприятия
+SELECT * FROM thing WHERE date > time::now()
+  AND date < time::now() + 30d
+  AND ->located_at->thing != NONE
+  ORDER BY date ASC;
+```
 
 ---
 
@@ -527,6 +639,8 @@ DEFINE FIELD until ON part_of TYPE option<datetime>;
 
 DEFINE TABLE participant TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD role ON participant TYPE string;
+
+DEFINE TABLE located_at TYPE RELATION FROM thing TO thing;
 DEFINE TABLE assigned_to TYPE RELATION FROM thing TO thing;
 DEFINE TABLE depends_on  TYPE RELATION FROM thing TO thing;
 DEFINE TABLE about       TYPE RELATION FROM thing TO thing;
@@ -686,6 +800,11 @@ SELECT * FROM thing WHERE postponed_count > 2
     поля:
       - quantity: число
       - unit: текст
+  located_at:
+    описание: где происходит событие или мероприятие
+    от: thing   # событие, мероприятие, встреча
+    к: thing    # место, адрес, заведение
+
   participant:
     описание: участник с конкретной ролью (не основной ответственный)
     от: thing   # задача, обещание, событие
