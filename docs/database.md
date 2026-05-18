@@ -6321,6 +6321,298 @@ ORDER BY последняя_сессия ASC;
 
 ---
 
+## IT-инфраструктура: сети, серверы, сервисы
+
+Сеть — это граф. Топология, зависимости сервисов, инциденты, мультитенант — всё ложится на нашу модель без новых таблиц. Единственное добавление — ребро `linked_to` для симметричных физических и логических линков.
+
+### Три уровня
+
+```
+Физический    — железо, стойки, кабели, порты
+Сетевой       — IP, VLAN, VPN, DNS, TLS
+Сервисный     — VM, контейнеры, процессы и их зависимости
+```
+
+### Новое ребро: linked_to
+
+Симметричный линк между двумя точками: порт↔порт, VPN-endpoint↔VPN-endpoint, пиринг↔пиринг.
+
+```surql
+DEFINE TABLE linked_to TYPE RELATION FROM thing TO thing SCHEMALESS;
+```
+
+Поля не фиксированы — на медном линке пишем `speed`, `duplex`, на VPN-туннеле — `protocol`, `cipher`, `endpoint`. Схема не мешает.
+
+### Виды узлов
+
+| kind | что это |
+|------|---------|
+| `сайт` | точка присутствия — дом, офис, ЦОД |
+| `стойка` | серверная стойка / шкаф |
+| `сервер` | физический сервер / NAS |
+| `вм` | виртуальная машина (Proxmox, VMware) |
+| `контейнер` | Docker / LXC контейнер |
+| `маршрутизатор` | L3-устройство |
+| `коммутатор` | L2-устройство |
+| `точка-доступа` | Wi-Fi AP |
+| `упс` | источник бесперебойного питания |
+| `интерфейс` | сетевой интерфейс (eth0, bond0, wg0) |
+| `порт` | физический порт на коммутаторе / патч-панели |
+| `подсеть` | IP-подсеть / VLAN |
+| `dns-зона` | зона DNS |
+| `dns-запись` | A / CNAME / MX / TXT запись |
+| `сертификат` | TLS-сертификат |
+| `впн` | VPN-туннель / оверлей |
+| `сервис` | запущенный процесс / приложение (nginx, postgres) |
+| `мониторинг-правило` | check / alert rule |
+| `алерт` | сработавшее правило мониторинга |
+| `инцидент` | авария / деградация |
+| `плановое-обслуживание` | maintenance window |
+| `резервная-копия` | backup job / snapshot |
+
+### Физический уровень
+
+```
+kind: сайт (дом / офис)
+  contains → kind: стойка
+    contains → kind: сервер
+      contains → kind: интерфейс
+        linked_to ←→ kind: порт (на коммутаторе)
+    contains → kind: коммутатор
+      contains → kind: порт
+    contains → kind: маршрутизатор
+    contains → kind: упс
+  located_at → kind: адрес
+```
+
+```mermaid
+graph TD
+    Site["kind: сайт\nname: Домашняя сеть"]
+    Rack["kind: стойка\nname: 12U под столом"]
+    Router["kind: маршрутизатор\nname: MikroTik RB4011"]
+    Switch["kind: коммутатор\nname: CSS326-24G"]
+    Server["kind: сервер\nname: Proxmox-home"]
+    UPS["kind: упс\nname: APC 1500"]
+    ISP["kind: маршрутизатор\nname: Роутер провайдера"]
+
+    Site -->|contains| Rack
+    Rack -->|contains| Router
+    Rack -->|contains| Switch
+    Rack -->|contains| Server
+    Rack -->|contains| UPS
+    Router ---|"linked_to\nmedium: copper"| ISP
+    Router ---|"linked_to\nspeed: 1G"| Switch
+    Server ---|"linked_to\nspeed: 1G"| Switch
+```
+
+### Сетевой уровень
+
+```
+kind: подсеть  (name: "LAN", cidr: "192.168.1.0/24")
+  part_of → kind: маршрутизатор
+
+kind: подсеть  (name: "IoT VLAN", cidr: "10.10.20.0/24", vlan_id: 20)
+  part_of → kind: коммутатор
+
+kind: впн  (name: "WireGuard road-warrior")
+  part_of → kind: сервер
+  linked_to ←→ kind: впн  (клиент на телефоне)
+
+kind: dns-зона  (name: "home.lan")
+  contains → kind: dns-запись  (type: A, name: proxmox, value: 192.168.1.10)
+    about → kind: сервер
+
+kind: сертификат  (name: "*.home.lan", expires_at: ...)
+  about → kind: сервис  (name: Nextcloud)
+```
+
+### Сервисный уровень и зависимости
+
+`depends_on` строит граф зависимостей сервисов. Обход в обратном направлении даёт blast radius — «что упадёт, если этот сервер ляжет».
+
+```
+kind: вм  (name: Nextcloud-VM)
+  part_of → kind: сервер
+
+kind: сервис  (name: Nextcloud)
+  part_of → kind: вм
+  depends_on → kind: сервис  (name: PostgreSQL)
+  depends_on → kind: сервис  (name: Redis)
+
+kind: сервис  (name: PostgreSQL)
+  part_of → kind: вм  (name: DB-VM)
+
+kind: сервис  (name: Pi-hole)
+  part_of → kind: контейнер
+  depends_on → kind: подсеть  (DNS-трафик идёт через него)
+```
+
+```mermaid
+graph LR
+    NC["kind: сервис\nname: Nextcloud"]
+    PG["kind: сервис\nname: PostgreSQL"]
+    RD["kind: сервис\nname: Redis"]
+    PH["kind: сервис\nname: Pi-hole"]
+    VM1["kind: вм\nname: App VM"]
+    VM2["kind: вм\nname: DB VM"]
+    CT["kind: контейнер\nname: pihole-ct"]
+    SRV["kind: сервер\nname: Proxmox-home"]
+
+    NC -->|depends_on| PG
+    NC -->|depends_on| RD
+    NC -->|part_of| VM1
+    PG -->|part_of| VM2
+    RD -->|part_of| VM1
+    PH -->|part_of| CT
+    VM1 -->|part_of| SRV
+    VM2 -->|part_of| SRV
+    CT -->|part_of| SRV
+```
+
+### IPAM: адреса как узлы
+
+IP-адрес можно хранить прямо в полях `интерфейса` (просто, достаточно для большинства случаев) или выделить в отдельный узел `kind: ip-адрес` для IPAM с историей назначений.
+
+```
+kind: интерфейс
+  name: eth0
+  ip: "192.168.1.10/24"
+  mac: "aa:bb:cc:dd:ee:ff"
+  part_of → kind: сервер
+  linked_to ←→ kind: порт
+```
+
+Для полноценного IPAM:
+```
+kind: ip-адрес  (address: "192.168.1.10", allocated_at: ...)
+  part_of → kind: подсеть
+  about → kind: интерфейс
+```
+
+### Мониторинг и инциденты
+
+```
+kind: мониторинг-правило  (name: "SSL expiry check", interval: "1d")
+  about → kind: сертификат
+  produces → kind: алерт  (при срабатывании через DEFINE EVENT)
+
+kind: алерт  (severity: "critical", fired_at: ...)
+  about → kind: сервис  (name: Nextcloud)
+  produces → kind: инцидент
+
+kind: инцидент  (name: "Nextcloud недоступен", started_at: ...)
+  about → kind: сервис
+  assigned_to → kind: пользователь  (я)
+  produces → kind: плановое-обслуживание  (когда инцидент закрыт)
+```
+
+```mermaid
+graph LR
+    Rule["kind: мониторинг-правило\nname: cert expiry"]
+    Cert["kind: сертификат\nexpires_at: 2025-07-01"]
+    Alert["kind: алерт\nseverity: warning"]
+    Inc["kind: инцидент\nname: Срок сертификата"]
+    Me["kind: пользователь\nname: Я"]
+
+    Rule -->|about| Cert
+    Rule -->|produces| Alert
+    Alert -->|produces| Inc
+    Inc -->|assigned_to| Me
+```
+
+### Мультитенант: чужие сети
+
+Каждая сеть — отдельный корневой узел `kind: сайт`. Пользователь получает `can_access` с нужными правами. Работает поверх нашей уже разработанной модели доступа.
+
+```
+kind: сайт  (name: "Сеть офиса ООО Ромашка")
+  ← can_access ← kind: пользователь  (Я, permissions: ["admin", "view"])
+
+kind: сайт  (name: "Домашняя сеть друга Коли")
+  ← can_access ← kind: пользователь  (Я, permissions: ["view", "edit"])
+```
+
+Если друг тоже использует Домовой — подключается через федерацию (shadow namespace). Если нет — узлы просто живут в нашем инстансе.
+
+**Аренда оборудования** органично вписывается:
+```
+kind: маршрутизатор  (name: "MikroTik запасной")
+  lent_to → kind: пользователь  (name: Коля, since: 2024-03-10)
+```
+
+### Связь с терминальными сессиями
+
+Уже спроектированный протокол терминальных сессий замыкается на IT-инфраструктуру через `about`:
+
+```
+kind: терминал-сессия
+  about → kind: сервер  (name: Proxmox-home)
+
+kind: изменение-сервера
+  part_of → kind: терминал-сессия
+  about → kind: сервис  (name: nginx)
+```
+
+Это даёт полную историю: кто, когда, на каком сервере, что сделал с каким сервисом.
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Blast radius: что зависит от этого сервера (транзитивно)
+SELECT name, kind FROM thing
+WHERE ->depends_on->thing->part_of->thing = thing:server_proxmox
+   OR ->depends_on->thing->part_of->thing->part_of->thing = thing:server_proxmox;
+
+-- Сертификаты, истекающие через 30 дней
+SELECT name, expires_at,
+       ->about->thing.name AS сервис
+FROM thing
+WHERE kind = "сертификат"
+  AND expires_at < time::now() + 30d
+ORDER BY expires_at ASC;
+
+-- Топология: все устройства в сайте с их линками
+SELECT name, kind,
+       <->linked_to<->thing.{ name, kind } AS соседи
+FROM thing
+WHERE ->part_of->thing = thing:site_home
+  AND kind IN ["сервер", "коммутатор", "маршрутизатор", "точка-доступа"];
+
+-- Сервисы без мониторингового правила
+SELECT name, kind FROM thing
+WHERE kind = "сервис"
+  AND count(<-about<-thing[WHERE kind = "мониторинг-правило"]) = 0;
+
+-- Все инциденты по чужим сетям, где я администратор
+SELECT name, started_at, ->about->thing.name AS объект,
+       ->about->thing->part_of->thing->part_of->thing.name AS сайт
+FROM thing
+WHERE kind = "инцидент"
+  AND ->about->thing->part_of->thing->part_of->thing IN (
+    SELECT id FROM thing
+    WHERE kind = "сайт"
+      AND <-can_access<-thing[WHERE id = $auth AND "admin" IN permissions]
+  )
+ORDER BY started_at DESC;
+
+-- История обслуживания конкретного сервера
+SELECT name, started_at, ended_at, ->assigned_to->thing.name AS кто
+FROM thing
+WHERE kind IN ["инцидент", "плановое-обслуживание"]
+  AND ->about->thing = thing:server_proxmox
+ORDER BY started_at DESC;
+
+-- Что я одолжил друзьям из железа
+SELECT name, kind,
+       ->lent_to->thing.name AS кому,
+       ->lent_to.since AS с_какого
+FROM thing
+WHERE kind IN ["сервер", "маршрутизатор", "коммутатор", "упс"]
+  AND ->lent_to->thing != NONE;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
