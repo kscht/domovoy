@@ -6832,6 +6832,287 @@ ORDER BY generated_at DESC;
 
 ---
 
+## AI-чаты, промпты и агенты
+
+Единый хаб для всех AI-инструментов. Чаты живут в графе как узлы, обогащаются данными из графа через `inputs` (RAG), ветвятся, запускаются параллельно, ссылаются друг на друга. Провайдер абстрагирован через `kind: источник-данных` — поменял один узел, все чаты переключились.
+
+### Новые виды узлов
+
+| kind | что это |
+|------|---------|
+| `чат` | conversation thread |
+| `сообщение` | одно сообщение в чате |
+| `модель-ai` | конфигурация AI-модели |
+| `промпт` | переиспользуемый шаблон промпта |
+| `коллекция-промптов` | библиотека промптов |
+| `запуск-ai` | параллельный запуск одного промпта через несколько моделей |
+| `агент-ai` | автономный AI-агент с триггерами и доступом к графу |
+
+### Провайдеры и прокси
+
+Домовой не знает, где физически живёт модель. Он знает только datasource — URL и auth. Всё, что говорит OpenAI-совместимый API, работает без изменений.
+
+Новые subtypes `kind: источник-данных`:
+
+| subtype | что это |
+|---------|---------|
+| `openai-compatible` | универсальный — LM Studio, LocalAI, vLLM, Ollama |
+| `anthropic` | Anthropic API напрямую |
+| `openai` | OpenAI API напрямую |
+| `google-ai` | Google AI (Gemini) |
+| `openrouter` | мета-прокси: один ключ → все провайдеры |
+| `litellm` | self-hosted прокси с учётом стоимости и маршрутизацией |
+| `groq` | быстрый inference |
+| `mistral` | Mistral AI |
+
+**Позднее связывание провайдера** — ключевой паттерн. Когда ещё не определился с провайдером, указываешь на прокси или LM Studio. Чаты ссылаются на этот datasource-узел. Когда определился — меняешь один узел, все чаты переключаются автоматически.
+
+```surql
+-- Пока экспериментируем с LM Studio локально
+CREATE thing:ds_local_ai SET
+  kind = "источник-данных",
+  subtype = "openai-compatible",
+  url = "http://localhost:1234/v1",
+  name = "LM Studio (эксперимент)",
+  fallback_to = thing:ds_openrouter;  -- если локальный недоступен
+
+-- Определились — переключаем на Anthropic
+UPDATE thing:ds_local_ai SET
+  subtype = "anthropic",
+  url = "https://api.anthropic.com";
+-- Все чаты, ссылающиеся на thing:ds_local_ai, теперь идут к Anthropic
+```
+
+Поле `fallback_to` (record<thing>) указывает на резервный datasource — воркер пробует его если основной вернул ошибку.
+
+### Чат
+
+```yaml
+kind: чат
+name: "Разбор инцидента на Proxmox"
+model_default: "claude-opus-4-7"
+provider: thing:ds_anthropic
+system_prompt: thing:prompt_devops_assistant   # поле, не ребро
+about: thing:server_proxmox                    # о чём чат
+part_of: thing:collection_devops_chats         # группировка
+inputs:
+  recent_incidents:
+    source: surreal
+    query: >
+      SELECT name, started_at, ->about->thing.name AS объект
+      FROM thing WHERE kind = 'инцидент'
+      ORDER BY started_at DESC LIMIT 5
+    format: text
+  server_services:
+    source: surreal
+    query: >
+      SELECT name, ->part_of->thing.name AS хост
+      FROM thing WHERE kind = 'сервис'
+        AND ->part_of->thing->part_of->thing = thing:server_proxmox
+    format: table
+```
+
+`inputs` вставляются в system message перед каждым запросом — это нативный RAG из графа без дополнительной инфраструктуры.
+
+### Сообщение
+
+```yaml
+kind: сообщение
+role: "user"          # user | assistant | system | tool
+content: "Посмотри на этот скриншот ошибки..."
+model: "gpt-4o"       # override, если переключили модель внутри чата
+tokens_in: 1842
+tokens_out: 512
+latency_ms: 2300
+cost_usd: 0.0031
+part_of: thing:chat_incident_proxmox
+# вложения (мультимодальность)
+attachments:
+  - type: image
+    vault_id: "file:screenshot_error"
+```
+
+Рёбра сообщения:
+```
+kind: сообщение
+  part_of → kind: чат
+  references → kind: сообщение   ← цитата из другого чата
+  references → kind: thing        ← RAG-узел, который был в контексте
+```
+
+### Ветвление чатов
+
+Ветвление — дерево через `part_of`. Поле `branch_point` ссылается на ID сообщения-развилки.
+
+```
+kind: чат  (родитель, сообщения 1–N)
+  ← part_of ← kind: чат  (ветка А, branch_point: "message:N")
+  ← part_of ← kind: чат  (ветка Б, branch_point: "message:N")
+```
+
+```mermaid
+graph TD
+    Root["kind: чат\nОсновной"]
+    M1["сообщение 1"]
+    M2["сообщение 2"]
+    M3["сообщение 3\n← развилка"]
+    BrA["kind: чат\nВетка А\nbranch_point: M3"]
+    BrB["kind: чат\nВетка Б\nbranch_point: M3"]
+    MA1["сообщение A1"]
+    MB1["сообщение B1"]
+
+    Root -->|contains| M1
+    Root -->|contains| M2
+    Root -->|contains| M3
+    BrA -->|part_of| Root
+    BrB -->|part_of| Root
+    BrA -->|contains| MA1
+    BrB -->|contains| MB1
+```
+
+### Параллельный запуск: сравнение моделей
+
+`kind: запуск-ai` — fan-out одного промпта через несколько моделей/провайдеров. Тот же паттерн, что юридические обжалования по инстанциям.
+
+```
+kind: запуск-ai
+  name: "Сравнение: анализ инцидента"
+  about → kind: промпт
+  produces → kind: чат  (Claude Opus, via ds_anthropic)
+  produces → kind: чат  (GPT-4o, via ds_openai)
+  produces → kind: чат  (Llama-3.3-70b, via ds_lmstudio)
+  produces → kind: чат  (Mistral Large, via ds_openrouter)
+```
+
+После завершения — виджет сравнивает `tokens_out`, `latency_ms`, `cost_usd`. Видно, кто быстрее, дешевле, качественнее для конкретной задачи.
+
+```mermaid
+graph TD
+    Run["kind: запуск-ai\nАнализ инцидента"]
+    Pr["kind: промпт\nDevOps-анализ"]
+    C1["kind: чат\nClaude Opus"]
+    C2["kind: чат\nGPT-4o"]
+    C3["kind: чат\nLlama local"]
+    C4["kind: чат\nMistral Large"]
+    W["kind: виджет\nchart_type: table\nСравнение результатов"]
+
+    Run -->|about| Pr
+    Run -->|produces| C1
+    Run -->|produces| C2
+    Run -->|produces| C3
+    Run -->|produces| C4
+    C1 -->|part_of| W
+    C2 -->|part_of| W
+    C3 -->|part_of| W
+    C4 -->|part_of| W
+```
+
+### Обогащение чата из другого чата
+
+```
+kind: чат  (Б)
+  references → kind: чат  (А)
+    mode: "context"
+    snapshot_text: "Краткое резюме чата А..."
+
+kind: сообщение  (в чате Б)
+  references → kind: сообщение  (из чата А)
+    mode: "quoted"
+    snapshot_text: "..."
+```
+
+Снапшот текста хранится в ребре — чат А может быть удалён или переехать, контекст сохраняется.
+
+### Библиотека промптов
+
+```
+kind: коллекция-промптов
+  name: "IT и DevOps"
+  can_access ← kind: пользователь
+
+kind: промпт
+  name: "Анализ инцидента"
+  text: "Ты опытный DevOps-инженер. Проанализируй инцидент и предложи решение..."
+  tags: ["devops", "incident", "debug"]
+  part_of → kind: коллекция-промптов
+  language: "ru"
+  model_hint: "claude-opus-4-7"   # рекомендованная модель
+```
+
+Промпты — те же `thing`-узлы: версионируются через `produces`, шарятся через `can_access`, привязываются к чату через поле `system_prompt`.
+
+### Агент
+
+```
+kind: агент-ai
+  name: "Мониторинг инфраструктуры"
+  model: "claude-haiku-4-5"
+  system_prompt: thing:prompt_infra_monitor
+  inputs:
+    alerts:
+      source: surreal
+      query: "SELECT * FROM thing WHERE kind='алерт' AND status='новый'"
+      format: text
+  triggered_by → kind: расписание  (каждые 15 минут)
+  about → kind: сайт               (следит за конкретной сетью)
+  produces → kind: чат             (лог работы агента)
+  produces → kind: инцидент        (если нашёл проблему)
+```
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Все чаты с суммарной стоимостью и количеством сообщений
+SELECT name, model_default,
+       count(<-part_of<-thing[WHERE kind = "сообщение"]) AS сообщений,
+       math::sum(<-part_of<-thing[WHERE kind = "сообщение"].cost_usd) AS стоимость_usd,
+       ->about->thing.name AS контекст
+FROM thing
+WHERE kind = "чат"
+ORDER BY стоимость_usd DESC;
+
+-- Сравнение результатов запуска-ai
+SELECT ->produces->thing.{ name, model_default,
+         math::sum(<-part_of<-thing.tokens_out) AS токенов,
+         math::sum(<-part_of<-thing.cost_usd) AS стоимость,
+         math::mean(<-part_of<-thing.latency_ms) AS латентность_мс
+       } AS модели
+FROM thing
+WHERE kind = "запуск-ai" AND id = thing:run_incident_analysis;
+
+-- Все ветки чата (дерево)
+SELECT id, name, branch_point,
+       count(<-part_of<-thing[WHERE kind = "сообщение"]) AS сообщений
+FROM thing
+WHERE kind = "чат" AND ->part_of->thing = thing:chat_main;
+
+-- Промпты, которые я использую чаще всего
+SELECT ->about->thing.name AS промпт, count() AS использований
+FROM thing
+WHERE kind = "чат" AND ->about->thing.kind = "промпт"
+GROUP BY промпт
+ORDER BY использований DESC;
+
+-- Стоимость AI за последние 30 дней по провайдерам
+SELECT ->part_of->thing->provider->thing.name AS провайдер,
+       math::sum(cost_usd) AS стоимость,
+       count() AS запросов
+FROM thing
+WHERE kind = "сообщение"
+  AND ->part_of->thing.created_at > time::now() - 30d
+GROUP BY провайдер
+ORDER BY стоимость DESC;
+
+-- Найти чаты, где обсуждался конкретный сервер
+SELECT name, created_at,
+       count(<-part_of<-thing[WHERE kind = "сообщение"]) AS сообщений
+FROM thing
+WHERE kind = "чат" AND ->about->thing = thing:server_proxmox
+ORDER BY created_at DESC;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
