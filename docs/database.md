@@ -9060,6 +9060,232 @@ ORDER BY attempt_number ASC;
 
 ---
 
+## Мультиязычность (i18n)
+
+Три уровня — три подхода:
+
+| Уровень | Где хранится | Подход |
+|---------|-------------|--------|
+| UI-строки (кнопки, лейблы) | JSON-файлы по локалям | `next-intl`, не в SurrealDB |
+| Контент узлов (name, content, description) | В самом `thing` | Embedded `_i18n` объект |
+| Системные промпты, шаблоны сообщений | В самом `thing` | Тот же `_i18n` |
+
+### Два поля на каждом thing
+
+```surql
+DEFINE FIELD _lang ON thing TYPE option<string>;   -- язык оригинала: "ru", "en", "de"
+DEFINE FIELD _i18n ON thing TYPE option<object>;   -- переводы + метаданные
+```
+
+Поля опциональны — узлы без `_lang` считаются на системном языке инстанса.
+
+```yaml
+# Пример: урок с переводами
+kind: урок
+name: "Жизненный цикл пода"
+content: "## Фазы пода\n\nPending → Running → Succeeded..."
+_lang: "ru"
+
+_i18n:
+  en:
+    name: "Pod Lifecycle"
+    content: "## Pod Phases\n\nPending → Running → Succeeded..."
+    status: "проверен"       # черновик | ai | проверен | опубликован | устарел
+    translated_at: "2025-05-19T10:00:00Z"
+    translated_by: "thing:agent_ai"
+    reviewed_by: "thing:user_john"
+    reviewed_at: "2025-05-19T12:00:00Z"
+    source_hash: "a3f1b2"    # hash от оригинальных полей
+  de:
+    name: "Pod-Lebenszyklus"
+    content: "## Pod-Phasen..."
+    status: "ai"
+    translated_at: "2025-05-19T11:00:00Z"
+    translated_by: "thing:agent_ai"
+    source_hash: "a3f1b2"
+  zh:
+    name: "Pod 生命周期"
+    status: "черновик"
+```
+
+### Почему embedded, а не отдельные узлы
+
+Узел путешествует вместе с переводами **атомарно**. При федерации shadow-копия несёт весь `_i18n` блок без дополнительных запросов. Пользователь из другой страны берёт граф — получает оригинал плюс все готовые переводы сразу. Можно добавить свой язык локально, не трогая оригинальный инстанс.
+
+### Language fallback при отдаче контента
+
+```surql
+-- Получить поле name на языке пользователя, fallback на оригинал
+SELECT
+  IF _i18n[$lang].name != NONE
+    AND _i18n[$lang].status IN ["проверен", "опубликован", "ai"]
+  THEN _i18n[$lang].name
+  ELSE name
+  END AS display_name,
+  _lang AS source_lang,
+  _i18n[$lang].status AS translation_status
+FROM thing WHERE id = $id;
+```
+
+Цепочка fallback: запрошенный язык → `_lang` (оригинал) → язык инстанса.
+
+### Обнаружение устаревших переводов
+
+При изменении оригинального контента DEFINE EVENT сравнивает `source_hash`:
+
+```surql
+DEFINE EVENT i18n_stale ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND ($before.name != $after.name OR $before.content != $after.content)
+    AND $after._i18n != NONE
+THEN {
+  LET $new_hash = crypto::md5(string::concat($after.name ?? "", $after.content ?? ""));
+
+  -- Пометить переводы с несовпадающим хешем как устаревшие
+  UPDATE $after.id SET _i18n = object::map($after._i18n, |$lang, $tr| {
+    IF $tr.source_hash != $new_hash
+    THEN object::add($tr, "status", "устарел")
+    ELSE $tr
+    END
+  });
+};
+```
+
+### Workflow перевода
+
+```mermaid
+graph LR
+    Src["Оригинальный\nконтент (_lang: ru)"]
+    PB["Плейбук\nАI-перевод"]
+    AI["kind: агент-ai\n(GPT-4o / Claude)"]
+    Draft["_i18n.en.status:\nai"]
+    Review["Человек-ревьюер\nредактирует / одобряет"]
+    Done["_i18n.en.status:\nпроверен"]
+    Stale["Источник изменился\nstatus: устарел"]
+
+    Src -->|создан / изменён| PB
+    PB --> AI
+    AI --> Draft
+    Draft --> Review
+    Review --> Done
+    Src -->|DEFINE EVENT| Stale
+    Stale -->|триггер| PB
+```
+
+**Плейбук AI-перевода:**
+
+```surql
+-- Запустить перевод конкретного узла на язык
+CREATE thing SET
+  kind = "запуск-плейбука",
+  status = "ожидание",
+  part_of = thing:playbook_ai_translate,
+  context = {
+    trigger: { node_id: $node_id, target_lang: "en", source_lang: $source_lang }
+  };
+```
+
+```yaml
+kind: плейбук
+name: "AI-перевод узла"
+steps:
+  - шаг: получить поля для перевода (SurrealQL)
+  - шаг: агент-ai переводит (с контекстом домена)
+  - шаг: UPDATE _i18n[target_lang] = { ..., status: "ai" }
+  - шаг: уведомить ревьюера (если нужна проверка)
+```
+
+Агент-ai получает в промпте контекст: домен узла (`kind`), соседние узлы, глоссарий проекта — чтобы терминология была согласованной.
+
+### Глоссарий (согласованность терминов)
+
+```yaml
+kind: глоссарий
+name: "IT-термины"
+entries:
+  pod:
+    ru: "под"
+    en: "pod"
+    de: "Pod"
+  deployment:
+    ru: "деплоймент"
+    en: "deployment"
+about: thing:course_k8s_admin    # к какому курсу/домену относится
+```
+
+При переводе агент получает `глоссарий` в контекст — термины переводятся единообразно.
+
+### Мультиязычность в федерации
+
+```
+Инстанс RU  →  граф с _lang: "ru", _i18n: { en: {...}, de: {...} }
+    ↓ федерация (shadow namespace)
+Инстанс DE  →  shadow-копия несёт весь _i18n атомарно
+              пользователь видит de если есть, иначе ru
+              может добавить _i18n.fr локально — не влияет на RU-инстанс
+```
+
+### Какие поля переводить
+
+Не все поля имеет смысл переводить. Конвенция:
+
+| Поле | Переводить? | Причина |
+|------|------------|---------|
+| `name` | да | отображается везде |
+| `content`, `text`, `description` | да | основной контент |
+| `status` | нет | enum, переводится на уровне UI |
+| `kind` | нет | системное |
+| `cron`, `url`, даты | нет | технические |
+| `tags` | опционально | зависит от использования |
+| Личные данные (задачи, инвентарь) | нет | персональный контекст |
+
+Переводить имеет смысл прежде всего системный контент: курсы, wiki, промпты ботов, шаблоны уведомлений.
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Все узлы без английского перевода (для очереди перевода)
+SELECT id, name, kind, _lang FROM thing
+WHERE _i18n.en = NONE
+  AND _lang != "en"
+  AND kind IN ["урок", "вопрос", "контент-блок", "промпт"]
+ORDER BY kind, name;
+
+-- Все устаревшие переводы
+SELECT id, name, _lang,
+       object::keys(_i18n) AS языки,
+       array::filter(object::keys(_i18n), |$l| _i18n[$l].status = "устарел") AS устарели
+FROM thing
+WHERE _i18n != NONE
+  AND array::any(object::values(_i18n), |$tr| $tr.status = "устарел");
+
+-- Прогресс перевода по языкам
+SELECT _i18n.*.status AS статус, count() AS узлов
+FROM thing
+WHERE _i18n != NONE
+GROUP BY статус;
+
+-- Узлы ожидающие ревью (переведены AI, не проверены человеком)
+SELECT id, name, kind, _lang,
+       array::filter(object::keys(_i18n), |$l| _i18n[$l].status = "ai") AS ждут_ревью
+FROM thing
+WHERE array::any(object::values(_i18n), |$tr| $tr.status = "ai")
+ORDER BY kind, name;
+
+-- Получить курс целиком на нужном языке
+SELECT
+  IF _i18n[$lang].name != NONE THEN _i18n[$lang].name ELSE name END AS name,
+  IF _i18n[$lang].content != NONE THEN _i18n[$lang].content ELSE content END AS content,
+  _lang AS original_lang,
+  _i18n[$lang].status AS translation_status
+FROM thing
+WHERE ->part_of->thing = thing:course_k8s_admin
+  OR id = thing:course_k8s_admin
+ORDER BY kind, order;
+```
+
+---
+
 ## Открытые вопросы
 
 - [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
