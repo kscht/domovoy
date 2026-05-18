@@ -3188,6 +3188,210 @@ WHERE kind = "код"
   );
 ```
 
+## Сценарий: триггеры, оркестрация и управление ресурсами
+
+### Два слоя
+
+```
+DB-уровень   — SurrealDB DEFINE EVENT: наблюдает за изменениями таблиц
+Граф-уровень — thing-узлы: триггеры, расписания, очереди, воркеры
+```
+
+`DEFINE EVENT` замечает изменение → создаёт `thing:job` (задание) → очередь →
+воркер забирает задание → запускает внешний модуль → результат попадает обратно в граф.
+
+### Триггер как узел
+
+```
+thing:trigger_new_media
+  kind: триггер
+  event_type: create                                   ← create / update / delete
+  condition: "status = 'не начато' AND kind IN ['voice_note','photo','scan']"
+  → produces → thing:queue_ai_light                    ← в какую очередь класть задание
+```
+
+SurrealDB-уровень, который это активирует:
+
+```surql
+DEFINE EVENT fire_trigger ON TABLE thing
+  WHEN $event = "CREATE"
+    AND $value.status = "не начато"
+    AND $value.kind IN ["voice_note", "photo", "scan"]
+  THEN {
+    CREATE thing SET
+      kind        = "задание",
+      status      = "ожидает",
+      priority    = 5,
+      queued_at   = time::now(),
+      payload_id  = $value.id
+    ;
+    RELATE $last->part_of->thing:queue_ai_light;
+  };
+```
+
+Триггер сам не выполняет работу — только создаёт задание в нужной очереди.
+
+### Расписание как узел
+
+```
+thing:schedule_budget_report
+  kind: расписание
+  cron: "0 9 * * MON"                 ← каждый понедельник в 09:00
+  enabled: true
+  → produces → thing:queue_reports    ← создаёт задание в очереди
+```
+
+Приложение читает активные расписания и создаёт задания по наступлению времени.
+
+### Пайплайн и шаги с обработкой ошибок
+
+Пайплайн — именованный DAG шагов. Шаги — `thing`, связаны `depends_on` и `part_of`:
+
+```
+thing:pipeline_ocr_receipt
+  kind: пайплайн
+
+thing:step_vision
+  kind: шаг
+  on_error: retry          ← retry / skip / fail / fallback
+  retry_count: 3
+  retry_delay: 30          ← секунд между попытками
+  → part_of    → thing:pipeline_ocr_receipt  (order: 1)
+  → assigned_to → thing:ai_vision            ← внешний модуль
+
+thing:step_parse
+  kind: шаг
+  on_error: fallback
+  → part_of    → thing:pipeline_ocr_receipt  (order: 2)
+  → depends_on → thing:step_vision
+  → assigned_to → thing:ai_claude
+  → produces   → thing:step_parse_fallback   ← альтернативная ветка при ошибке
+
+thing:step_save
+  kind: шаг
+  on_error: fail
+  → part_of    → thing:pipeline_ocr_receipt  (order: 3)
+  → depends_on → thing:step_parse
+```
+
+### Очереди и воркеры
+
+Ключевой механизм защиты от перегрузки. Тяжёлые и лёгкие задачи — в разных очередях:
+
+```
+thing:queue_ai_heavy
+  kind: очередь
+  max_concurrent: 1          ← не более одного тяжёлого AI одновременно
+  priority_strategy: fifo    ← fifo / priority / deadline
+
+thing:queue_ai_light
+  kind: очередь
+  max_concurrent: 4          ← лёгкие задачи идут параллельно
+
+thing:queue_reports
+  kind: очередь
+  max_concurrent: 1
+  priority_strategy: deadline
+```
+
+Воркер — процесс или машина, которая обслуживает очередь:
+
+```
+thing:worker_local_cpu
+  kind: воркер
+  status: свободен           ← свободен / занят / офлайн
+  resources: {cpu: 4, ram_gb: 8}
+  → part_of → thing:queue_ai_light
+
+thing:worker_gpu_server
+  kind: воркер
+  status: свободен
+  resources: {gpu: 1, vram_gb: 8, ram_gb: 32}
+  → part_of → thing:queue_ai_heavy
+```
+
+```mermaid
+graph TD
+    Trigger[Триггер:\nновое фото чека]
+    JobQ[Задание\nstatus: ожидает]
+    QL[Очередь ai_light\nmax_concurrent: 4]
+    QH[Очередь ai_heavy\nmax_concurrent: 1]
+    WL[Воркер CPU\nстатус: свободен]
+    WH[Воркер GPU\nстатус: занят]
+    P[Пайплайн: OCR чека]
+    Out[Результат в графе]
+
+    Trigger -->|CREATE задание| JobQ
+    JobQ -->|part_of| QL
+    QL -->|воркер забирает| WL
+    WL -->|запускает| P
+    P -->|produces| Out
+    QH -->|ждёт| WH
+```
+
+### Бюджет ресурсов
+
+Защита от перерасхода API-токенов или локальных ресурсов:
+
+```
+thing:budget_claude_daily
+  kind: бюджет-ресурса
+  resource: claude_tokens
+  limit: 100000
+  used: 47000
+  period: день
+  reset_at: 2026-05-19T00:00:00Z
+
+thing:budget_whisper_hourly
+  kind: бюджет-ресурса
+  resource: whisper_minutes
+  limit: 60
+  used: 12
+  period: час
+```
+
+Воркер проверяет бюджет перед запуском задания. Если лимит исчерпан — задание остаётся
+в очереди до сброса счётчика.
+
+### Автоматический выключатель (circuit breaker)
+
+Если внешний модуль начинает падать — перестаём его дёргать:
+
+```
+thing:breaker_ai_claude
+  kind: автовыключатель
+  status: закрыт             ← закрыт (норма) / открыт (стоп) / полуоткрыт (проверка)
+  error_count: 0
+  error_threshold: 5         ← N ошибок подряд → открыть
+  recovery_timeout: 120      ← сек до следующей попытки
+  → about → thing:ai_claude
+```
+
+```surql
+-- Все задания в очереди, упорядоченные по приоритету и времени
+SELECT name, priority, queued_at, ->part_of->thing.name AS очередь
+FROM thing
+WHERE kind = "задание" AND status = "ожидает"
+ORDER BY priority DESC, queued_at ASC;
+
+-- Нагрузка по воркерам
+SELECT name, status,
+       count(<-part_of<-thing[WHERE kind = "задание" AND status = "выполняется"]) AS активных
+FROM thing WHERE kind = "воркер";
+
+-- Бюджеты ресурсов: что близко к лимиту
+SELECT name, resource, used, limit,
+       math::round((used / limit) * 100) AS процент
+FROM thing
+WHERE kind = "бюджет-ресурса"
+ORDER BY процент DESC;
+
+-- Открытые автовыключатели (модули с проблемами)
+SELECT name, error_count, ->about->thing.name AS модуль
+FROM thing
+WHERE kind = "автовыключатель" AND status = "открыт";
+```
+
 ---
 
 ## Открытые вопросы
