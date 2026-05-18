@@ -2867,6 +2867,199 @@ thing:topic_health name: "Здоровье"   → part_of → thing:wiki_root
 thing:topic_family name: "Семья"      → part_of → thing:wiki_root
 ```
 
+## Сценарий: исполняемый код в документах (Jupyter / Quarto-стиль)
+
+Документы могут содержать ячейки с кодом — они исполняются и хранят вывод прямо в графе.
+Никаких новых рёбер не нужно: `part_of`, `requires`, `produces`, `represents`, `expert_in`.
+
+### Ячейка кода
+
+Это обычный блок (`part_of` документ), но с `kind: код`:
+
+```
+thing:cell_describe
+  kind: код
+  language: python
+  source: "df[['цена', 'количество']].describe()"
+  status: выполнено
+  executed_at: 2026-05-18T10:00:00Z
+  → part_of  → thing:doc_analysis   (order: 5)
+  → requires → thing:runtime_python
+  → produces → thing:output_describe
+```
+
+Поле `status` — тот же набор, что у задач: `не выполнено` / `в процессе` / `выполнено` / `ошибка`.
+
+### Типы вывода
+
+| `output_type` | Хранение |
+|---------------|----------|
+| `текст` | поле `text` на узле вывода |
+| `таблица` | поле `text` (JSON/CSV) или vault-файл |
+| `изображение` | vault-файл через `represents` |
+| `ошибка` | поле `text` (traceback) |
+| `html` | поле `text` |
+
+```
+thing:output_describe
+  kind: вывод
+  output_type: текст
+  status: актуально
+  text: "count   100\nmean    42.3\nstd     7.1\n..."
+  → part_of → thing:cell_describe
+
+thing:output_plot
+  kind: вывод
+  output_type: изображение
+  status: актуально
+  → part_of    → thing:cell_plot
+  → represents → thing:file_plot_png    ← vault: ~/.domovoy/files/{id}/plot.png
+```
+
+### Рантайм (ядро)
+
+```
+thing:runtime_python
+  name: "Python 3.11"
+  kind: рантайм
+  endpoint: "ws://localhost:8888/kernel/abc123"
+
+thing:runtime_r
+  name: "R 4.3"
+  kind: рантайм
+  endpoint: "ws://localhost:8889/kernel/def456"
+
+thing:runtime_deno
+  name: "Deno / Observable JS"
+  kind: рантайм
+  endpoint: "http://localhost:8890"
+```
+
+### Пакеты как узлы
+
+Установленные пакеты — `thing part_of рантайм`. Это позволяет проверять совместимость:
+
+```
+thing:pkg_pandas   name: "pandas"   version: "2.2.1"  → part_of → thing:runtime_python
+thing:pkg_plotly   name: "plotly"   version: "5.20"   → part_of → thing:runtime_python
+thing:pkg_ggplot2  name: "ggplot2"  version: "3.5.0"  → part_of → thing:runtime_r
+```
+
+```surql
+-- Все пакеты в рантайме Python
+SELECT name, version FROM thing
+WHERE ->part_of->thing = thing:runtime_python AND kind = "пакет"
+ORDER BY name ASC;
+
+-- Документы, которые требуют конкретный пакет (транзитивно через ячейки)
+SELECT DISTINCT ->part_of->thing.name AS документ
+FROM thing
+WHERE kind = "код"
+  AND ->requires->thing->part_of->thing = thing:pkg_pandas;
+```
+
+### Внешние модули рендера
+
+Расширения, которые добавляют поддержку новых языков или источников данных:
+
+```
+thing:renderer_sql
+  name: "SQL renderer"
+  kind: модуль-рендера
+  handles: sql
+  → filed_with → thing:db_surrealdb   ← к какой БД подключается
+  → expert_in  → thing:lang_sql
+
+thing:renderer_observable
+  name: "Observable JS"
+  kind: модуль-рендера
+  handles: javascript
+  → expert_in → thing:lang_javascript
+
+thing:renderer_mermaid
+  name: "Mermaid диаграммы"
+  kind: модуль-рендера
+  handles: mermaid
+  → expert_in → thing:lang_mermaid
+```
+
+Ячейка `requires` модуль рендера так же, как рантайм:
+
+```
+thing:cell_diagram
+  kind: код
+  language: mermaid
+  source: "graph TD\n  A-->B"
+  → part_of  → thing:doc_architecture  (order: 2)
+  → requires → thing:renderer_mermaid
+```
+
+### Переисполнение и история выводов
+
+При повторном запуске старый вывод помечается `status: устарело`, создаётся новый:
+
+```surql
+-- Пометить старые выводы ячейки устаревшими
+UPDATE thing SET status = "устарело"
+WHERE ->part_of->thing = thing:cell_describe AND kind = "вывод";
+
+-- Создать новый вывод
+CREATE thing SET
+  kind = "вывод",
+  output_type = "текст",
+  status = "актуально",
+  text = "...",
+  created_at = time::now();
+RELATE thing:cell_describe->produces->$new_output;
+```
+
+История всех выводов ячейки хранится в графе — можно откатиться или сравнить.
+
+### Документ с кодом: полная картина
+
+```mermaid
+graph TD
+    Doc[Документ: анализ расходов]
+    B1[Блок: заголовок\nkind: текст]
+    B2[Блок: загрузка данных\nkind: код, python]
+    B3[Блок: описание\nkind: текст]
+    B4[Блок: график\nkind: код, python]
+    B5[Блок: вывод\nkind: текст]
+
+    Out2[Вывод: таблица]
+    Out4[Вывод: изображение]
+    File[Файл: chart.png\nвault]
+    Runtime[Python 3.11\nрантайм]
+
+    B1 -->|part_of, order 1| Doc
+    B2 -->|part_of, order 2| Doc
+    B3 -->|part_of, order 3| Doc
+    B4 -->|part_of, order 4| Doc
+    B5 -->|part_of, order 5| Doc
+    B2 -->|produces| Out2
+    B4 -->|produces| Out4
+    Out4 -->|represents| File
+    B2 -->|requires| Runtime
+    B4 -->|requires| Runtime
+```
+
+```surql
+-- Все исполняемые ячейки документа и их статус
+SELECT name, language, status, executed_at,
+       ->produces->thing[WHERE status = "актуально"].output_type AS тип_вывода
+FROM thing
+WHERE ->part_of->thing = thing:doc_analysis AND kind = "код"
+ORDER BY ->part_of.order ASC;
+
+-- Ячейки с устаревшим выводом (нужно переисполнить)
+SELECT name, language FROM thing
+WHERE kind = "код"
+  AND (
+    count(->produces->thing[WHERE status = "актуально"]) = 0
+    OR status = "ошибка"
+  );
+```
+
 ---
 
 ## Открытые вопросы
