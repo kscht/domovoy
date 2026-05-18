@@ -7690,6 +7690,268 @@ ORDER BY последний_запрос DESC;
 
 ---
 
+## Плейбуки (workflows)
+
+Плейбук — это граф шагов. Каждый шаг оборачивает любой существующий модуль: воркер, агент-ai, шлюз, источник-данных. Шаги связаны явными путями `on_success` / `on_failure`. Runtime-состояние одного запуска живёт в `kind: запуск-плейбука`. Новых рёбер не нужно.
+
+### Новые виды узлов
+
+| kind | что это |
+|------|---------|
+| `плейбук` | определение workflow — DAG шагов |
+| `шаг` | один шаг: обёртка над модулем + маршрутизация |
+| `запуск-плейбука` | runtime-состояние одного исполнения |
+
+### Сравнение с n8n
+
+| n8n | Домовой |
+|-----|---------|
+| Workflow | `kind: плейбук` |
+| Node | `kind: шаг` |
+| Connection | `on_success` / `on_failure` (поля шага) |
+| Trigger | `triggered_by` (уже есть) |
+| Execution | `kind: запуск-плейбука` |
+| Credentials | `kind: источник-данных` (уже есть) |
+| HTTP Request | `kind: воркер` subtype: http |
+| Code | `kind: воркер` subtype: python \| js |
+| AI Agent | `kind: агент-ai` (уже есть) |
+| Send Email | `kind: шлюз` subtype: smtp |
+| Telegram | `kind: шлюз` subtype: telegram |
+| Database | `kind: источник-данных` |
+| Wait | `kind: шаг` с condition на внешнее событие |
+| Manual trigger | `kind: запуск-плейбука` создаётся вручную |
+
+### kind: плейбук
+
+```yaml
+kind: плейбук
+name: "Обработка нового заказа"
+description: "Валидация → склад → письмо → уведомление менеджера"
+first_step: thing:step_check_payment    # точка входа
+triggered_by: thing:event_new_order     # или расписание, или шлюз
+about: thing:shop_main                  # к какому контексту привязан
+max_concurrent_runs: 10                 # защита от перегрузки
+timeout_sec: 300                        # дедлайн на весь запуск
+```
+
+### kind: шаг
+
+```yaml
+kind: шаг
+name: "Проверить оплату"
+part_of: thing:playbook_new_order       # принадлежит плейбуку
+order: 1                                # порядок (для UI)
+module: thing:worker_check_payment      # воркер | агент-ai | шлюз | источник-данных
+
+# маршрутизация
+on_success: thing:step_update_stock     # следующий шаг при успехе
+on_failure: thing:step_notify_support   # шаг при ошибке
+condition: "$.output.status == 'paid'"  # guard-выражение (JSONPath)
+retry_count: 3                          # количество повторов при ошибке
+retry_delay_sec: 10
+
+# данные из триггера и предыдущих шагов
+inputs:
+  order_id:  "$trigger.id"
+  amount:    "$steps.step_validate.output.total"
+  user_name: "$trigger.user.name"
+```
+
+Модуль в поле `module` — любой существующий kind: `воркер`, `агент-ai`, `шлюз`, `источник-данных`. Шаг — только обёртка с маршрутизацией и маппингом данных.
+
+### kind: запуск-плейбука
+
+Живёт только во время исполнения и сохраняется как история после завершения.
+
+```yaml
+kind: запуск-плейбука
+status: "ожидание" | "запущен" | "завершён" | "ошибка" | "отменён"
+started_at: datetime
+finished_at: datetime
+part_of: thing:playbook_new_order
+triggered_by: thing:event_order_12345
+
+# runtime-состояние (обновляется воркером по мере выполнения)
+context:
+  trigger:
+    id: "thing:order_12345"
+    user: { name: "Иван", email: "ivan@example.com" }
+  steps:
+    step_check_payment:
+      status: completed
+      started_at: "2025-05-19T10:00:01Z"
+      finished_at: "2025-05-19T10:00:03Z"
+      output: { status: "paid", amount: 2500 }
+    step_update_stock:
+      status: running
+      started_at: "2025-05-19T10:00:03Z"
+    step_notify_support:
+      status: skipped
+```
+
+### Пример: заказ в интернет-магазине
+
+```mermaid
+graph TD
+    T["triggered_by\nНовый заказ"]
+    S1["kind: шаг\nПроверить оплату\nmodule: HTTP воркер"]
+    S2["kind: шаг\nОбновить остатки\nmodule: SurrealQL воркер"]
+    S3["kind: шаг\nОтправить письмо\nmodule: шлюз smtp"]
+    S4["kind: шаг\nУведомить менеджера\nmodule: шлюз telegram"]
+    S5["kind: шаг\nСоздать задачу для поддержки\nmodule: SurrealQL воркер"]
+    END["завершён"]
+    ERR["ошибка"]
+
+    T --> S1
+    S1 -->|on_success| S2
+    S1 -->|on_failure| S5
+    S2 -->|on_success| S3
+    S2 -->|on_failure| S5
+    S3 -->|on_success| S4
+    S4 -->|on_success| END
+    S5 --> ERR
+```
+
+```surql
+-- Создать плейбук
+CREATE thing:playbook_new_order SET
+  kind = "плейбук",
+  name = "Обработка нового заказа",
+  first_step = thing:step_check_payment,
+  max_concurrent_runs = 10,
+  timeout_sec = 300;
+
+-- Создать шаги
+CREATE thing:step_check_payment SET
+  kind = "шаг",
+  name = "Проверить оплату",
+  part_of = thing:playbook_new_order,
+  order = 1,
+  module = thing:worker_http_payment,
+  on_success = thing:step_update_stock,
+  on_failure = thing:step_notify_support,
+  retry_count = 3,
+  inputs = {
+    order_id: "$trigger.id",
+    amount:   "$trigger.amount"
+  };
+
+-- Запустить плейбук вручную
+CREATE thing SET
+  kind = "запуск-плейбука",
+  status = "ожидание",
+  part_of = thing:playbook_new_order,
+  context = { trigger: { id: "thing:order_999", amount: 1500 } };
+```
+
+### Ветвление и условия
+
+`condition` — JSONPath-выражение над `$.output` текущего шага. Если выражение ложно — идём по `on_failure`. Если нужно несколько путей — шаг-роутер:
+
+```yaml
+kind: шаг
+name: "Роутер по сумме заказа"
+module: thing:worker_router        # встроенный роутер-воркер
+condition_routes:
+  - condition: "$.output.amount > 10000"
+    next: thing:step_vip_flow
+  - condition: "$.output.amount > 1000"
+    next: thing:step_standard_flow
+  - default: thing:step_small_order_flow
+```
+
+### Цикл (loop)
+
+Шаг ссылается на себя через `on_success` с guard-условием выхода:
+
+```yaml
+kind: шаг
+name: "Опросить API пока не готово"
+module: thing:worker_poll_status
+on_success: thing:step_self          # сам на себя
+on_failure: thing:step_continue      # выход из цикла когда ready
+condition: "$.output.status != 'ready'"  # продолжать если не готово
+retry_count: 20
+retry_delay_sec: 15
+```
+
+### Параллельные шаги
+
+Шаг-разветвитель запускает несколько шагов одновременно, шаг-слияние ждёт всех:
+
+```yaml
+kind: шаг
+name: "Запустить параллельно"
+module: thing:worker_fan_out
+parallel_steps:
+  - thing:step_send_email
+  - thing:step_update_crm
+  - thing:step_notify_telegram
+merge_step: thing:step_after_all    # продолжить когда все завершились
+```
+
+### Связь с оркестратором и очередями
+
+Плейбуки работают поверх уже спроектированных очередей и воркеров:
+
+```
+kind: запуск-плейбука (status: ожидание)
+  → помещается в kind: очередь
+    → kind: воркер (оркестратор плейбуков)
+      → читает шаги, запускает модули, обновляет context
+      → при ошибке: retry или on_failure-путь
+      → при таймауте: status = "ошибка", lock сбрасывается
+```
+
+Оркестратор — отдельный `kind: воркер` с `kind: очередь` для запусков. Масштабирование через `max_concurrent` очереди.
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Все плейбуки с количеством шагов и последним запуском
+SELECT name,
+       count(<-part_of<-thing[WHERE kind = "шаг"]) AS шагов,
+       max(<-part_of<-thing[WHERE kind = "запуск-плейбука"].started_at) AS последний_запуск,
+       count(<-part_of<-thing[WHERE kind = "запуск-плейбука" AND status = "ошибка"]) AS ошибок
+FROM thing
+WHERE kind = "плейбук";
+
+-- Активные запуски прямо сейчас
+SELECT ->part_of->thing.name AS плейбук,
+       started_at, status,
+       context.steps AS шаги
+FROM thing
+WHERE kind = "запуск-плейбука" AND status = "запущен"
+ORDER BY started_at ASC;
+
+-- История запусков с длительностью
+SELECT ->part_of->thing.name AS плейбук,
+       started_at, finished_at, status,
+       time::duration(finished_at - started_at) AS длительность
+FROM thing
+WHERE kind = "запуск-плейбука"
+ORDER BY started_at DESC LIMIT 50;
+
+-- Шаги с наибольшим числом ошибок
+SELECT name, ->part_of->thing.name AS плейбук,
+       count() AS запусков,
+       count(context.steps[$parent.name].status = "failed") AS ошибок
+FROM thing
+WHERE kind = "шаг"
+ORDER BY ошибок DESC LIMIT 10;
+
+-- Граф плейбука: все шаги и переходы
+SELECT name, order, module.name AS модуль,
+       on_success.name AS при_успехе,
+       on_failure.name AS при_ошибке,
+       condition
+FROM thing
+WHERE kind = "шаг" AND ->part_of->thing = thing:playbook_new_order
+ORDER BY order ASC;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
