@@ -126,7 +126,7 @@ SELECT * FROM thing WHERE status = "в процессе" AND template != true;
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
 **`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
-**`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`  
+**`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель` / `заказчик`  
 **`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации  
 **`printed_at` на ребре `identified_by`:** дата когда физическая наклейка была распечатана и наклеена; если отсутствует — код известен, но наклейка не печаталась
 
@@ -865,7 +865,8 @@ SELECT * FROM thing WHERE postponed_count > 2
       - расписание: текст          # "каждую пятницу", "до 10-го числа", "каждые 10000 км"
       - повтор_напоминания: текст  # для напоминаний: "каждый день за 3 дня до"
       - роль: текст                # для людей: папа / мама / сын / дочь / бабушка
-      - сумма: число               # для платежей
+      - сумма: число               # для платежей и смет: договорная цена
+      - сумма_факт: число          # итоговая стоимость после выполнения (может отличаться от сметы)
       - день_оплаты: число         # число месяца: 1–31
       - оплачено_до: дата
     дополнительные: любые
@@ -2484,6 +2485,151 @@ FROM thing WHERE code_value = "84291043" AND code_system = "ozon";
 -- Все лекарства с Честным знаком (для проверки сроков)
 SELECT <-identified_by<-thing.*
 FROM thing WHERE code_type = "честный_знак";
+```
+
+---
+
+## Сценарий: ремонт, подряд, субподряд
+
+Внешний заказ — `thing` с `filed_with` → исполнитель, `about` → объект работ.
+Субподряд — такой же `thing`, но `part_of` родительского контракта. Глубина не ограничена.
+
+### Ремонт вещи в мастерской
+
+```mermaid
+graph TD
+    Dad[Папа]
+    Shop[Мотосервис Иванова]
+    Mechanic[Механик Сергей]
+    Moto[Мотоцикл]
+
+    Repair[Заказ: ТО + сцепление\nstatus: в процессе\ndeadline: 25 мая\namount: 8500\namount_actual: 9200]
+    Invoice[Акт выполненных работ]
+    Warranty[Гарантия на сцепление\nexpires_at: 25 ноя 2026]
+
+    Repair -->|filed_with| Shop
+    Repair -->|assigned_to| Mechanic
+    Repair -->|about| Moto
+    Repair -->|assigned_to| Dad
+    Moto -->|contains, reason: ремонт| Shop
+    Repair -->|produces| Invoice
+    Repair -->|produces| Warranty
+```
+
+Когда мотоцикл забрали — `contains` переключается обратно на гараж.
+`amount` — смета при сдаче. `amount_actual` — итог после выполнения.
+
+### Подряд с этапами
+
+```mermaid
+graph TD
+    Dad[Папа]
+    Vasya[ИП Васильев\nподрядчик]
+
+    Contract[Договор: забор 45 пог.м\namount: 45000\ndeadline: 1 июля]
+
+    S1[Этап 1: фундамент\ndeadline: 10 июня\namount: 15000]
+    S2[Этап 2: столбы\ndeadline: 20 июня\namount: 18000]
+    S3[Этап 3: секции\ndeadline: 1 июля\namount: 12000]
+
+    P1[Оплата этапа 1]
+    P2[Оплата этапа 2]
+    P3[Оплата этапа 3]
+
+    Contract -->|filed_with| Vasya
+    Contract -->|assigned_to| Vasya
+    S1 -->|part_of| Contract
+    S2 -->|part_of| Contract
+    S3 -->|part_of| Contract
+    S1 -->|produces| P1
+    S2 -->|produces| P2
+    S3 -->|produces| P3
+    P1 -->|depends_on| S1
+    P2 -->|depends_on| S2
+    P3 -->|depends_on| S3
+```
+
+### Субподряд: произвольная глубина
+
+Вася нанимает субподрядчиков — их контракты `part_of` основного. Папа видит
+всю цепочку запросом, хотя напрямую работает только с Васей.
+
+```mermaid
+graph TD
+    Dad[Папа]
+    Vasya[Вася — подрядчик]
+    Kolya[Коля — субподряд\nфундамент]
+    Beton[БетонСтрой — субподряд\nзаливка]
+
+    Contract[Договор: забор\nПапа ↔ Вася]
+    Sub1[Субподряд: фундамент\nВася ↔ Коля\namount: 12000]
+    Sub2[Субподряд: заливка\nКоля ↔ БетонСтрой\namount: 7000]
+
+    Contract -->|filed_with| Vasya
+    Sub1 -->|part_of| Contract
+    Sub1 -->|filed_with| Kolya
+    Sub1 -->|assigned_to| Kolya
+    Sub1 -->|participant, role: заказчик| Vasya
+    Sub2 -->|part_of| Sub1
+    Sub2 -->|filed_with| Beton
+    Sub2 -->|assigned_to| Beton
+    Sub2 -->|participant, role: заказчик| Kolya
+```
+
+`participant, role: заказчик` явно указывает кто заказал у кого на каждом уровне.
+Оплата — отдельные цепочки: Папа → Вася, Вася → Коля, Коля → БетонСтрой.
+
+### Простое поручение
+
+Разовое задание знакомому или мастеру без формального договора:
+
+```
+thing:commission_sink
+  name: "Починить кран на кухне"
+  amount: 1500
+  deadline: 20 мая
+  → assigned_to  → thing:plumber_nikolay
+  → about        → thing:kitchen_sink
+  → promised_to  → Папа                  ← если было устное обещание
+  → produces     → thing:invoice_sink
+```
+
+### Ответственность при срыве субподряда
+
+Если Коля срывает срок — `Sub1 status: задержка`. Это `part_of` основного контракта,
+поэтому Вася видит проблему и несёт ответственность перед Папой:
+
+```surql
+-- Все просроченные субподряды по основному контракту
+SELECT name, status, deadline, ->assigned_to->thing.name AS исполнитель
+FROM thing WHERE ->part_of->thing = thing:contract_fence
+  OR ->part_of->thing->part_of->thing = thing:contract_fence
+  AND deadline < time::now() AND status != "выполнено";
+```
+
+```surql
+-- Все исполнители по проекту на любой глубине
+SELECT name AS контракт,
+       ->assigned_to->thing.name AS исполнитель,
+       amount AS сумма, amount_actual AS факт
+FROM thing WHERE ->part_of->thing = thing:contract_fence DEPTH 5;
+
+-- Суммарная стоимость всех субподрядов (риск Васи)
+SELECT math::sum(amount) AS итого_субподряды
+FROM thing WHERE ->part_of->thing = thing:contract_fence
+  AND filed_with != thing:vasya;
+
+-- Все активные внешние заказы и их статус
+SELECT name, status, deadline, amount, amount_actual,
+       ->filed_with->thing.name AS исполнитель,
+       ->about->thing.name AS объект
+FROM thing WHERE filed_with != NONE
+  AND status NOT IN ["выполнено", "отменено"]
+ORDER BY deadline ASC;
+
+-- Вещи сейчас в ремонте
+SELECT <-contains<-thing[WHERE reason = "ремонт"].*
+FROM thing WHERE kind = "физическое";
 ```
 
 ---
