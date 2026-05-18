@@ -3993,6 +3993,199 @@ WHERE _shadow != true
   → datasource с type: domovoy недоступен → fallback на кэш или пустой результат
 ```
 
+## Сценарий: публичный граф
+
+### Принципал thing:public
+
+Специальный узел-группа. Неаутентифицированный HTTP-запрос трактуется как этот принципал.
+Не нужно создавать отдельных пользователей — достаточно `can_access`:
+
+```
+thing:public
+  kind: группа
+  name: "Все (без аутентификации)"
+```
+
+Любой контейнер или узел становится публичным одним ребром:
+
+```surql
+RELATE thing:catalog_electronics->can_access->thing:public
+  SET permissions = ["view"], granted_by = thing:owner, status = "active";
+```
+
+### Публикация как узел
+
+Обёртка с метаданными — slug для URL, режим live или snapshot:
+
+```
+thing:pub_electronics
+  kind: публикация
+  slug: "electronics-catalog"
+  published_at: 2026-05-19T10:00:00Z
+  live: true              ← true = всегда текущее состояние контейнера
+                          ← false = snapshot на момент публикации
+  → about → thing:catalog_electronics   ← что публикуется
+  → can_access ← thing:public           ← доступно всем
+```
+
+URL вида `https://домовой.local/pub/electronics-catalog` → резолвится в `thing:pub_electronics`
+→ отдаёт дерево `thing:catalog_electronics` с его `part_of`-потомками.
+
+### Каталог магазина
+
+```mermaid
+graph TD
+    Pub[Публикация: каталог\nslug: electronics-catalog\nlive: true]
+    Cat[Каталог: Электроника]
+    C1[Категория: Телефоны]
+    C2[Категория: Ноутбуки]
+
+    P1[Смартфон XYZ\nprice: 25000\nstock: 14]
+    P2[Смартфон ABC\nprice: 18000\nstock: 0]
+    P3[Ноутбук DEF\nprice: 65000\nstock: 3]
+
+    QR1[QR-код\ncode_value: SKU-001]
+    QR2[QR-код\ncode_value: SKU-002]
+
+    Pub -->|about| Cat
+    C1 -->|part_of| Cat
+    C2 -->|part_of| Cat
+    P1 -->|part_of| C1
+    P2 -->|part_of| C1
+    P3 -->|part_of| C2
+    P1 -->|identified_by| QR1
+    P2 -->|identified_by| QR2
+```
+
+Поля товара — обычные поля `thing`:
+
+```
+thing:product_phone_xyz
+  name: "Смартфон XYZ 256GB"
+  description: "..."
+  price: 25000
+  stock: 14
+  sku: "SKU-001"
+  images: ["file_id_1", "file_id_2"]   ← ID файлов в vault
+  → part_of      → thing:cat_phones
+  → identified_by → thing:qr_sku001    ← физический QR на товаре
+  → can_access   ← thing:public        ← карточка публична
+```
+
+Покупатель сканирует QR в магазине → `identified_by` → `thing:product_phone_xyz` →
+публичная карточка с описанием, ценой, наличием.
+
+### Публичный квиз
+
+Вопросы публичны, попытки хранятся в Домовом участника:
+
+```
+-- У автора квиза (его Домовой):
+thing:quiz_geography
+  kind: квиз
+  name: "География мира"
+  → can_access ← thing:public           ← квиз публичен
+
+thing:q1  text: "Столица Бразилии?"
+  → part_of → thing:quiz_geography
+  → can_access ← thing:public           ← вопросы публичны
+
+-- У участника (его собственный Домовой):
+thing:my_attempt_geo
+  kind: попытка
+  started_at: 2026-05-19T11:00:00Z
+  score: 7
+  → about → thing:shadow__abc123__quiz_geography   ← теневая копия квиза
+
+thing:my_ans_1
+  chosen: "Бразилиа"
+  correct: true
+  points_earned: 1
+  → answered → thing:shadow__abc123__q1            ← теневая копия вопроса
+  → part_of  → thing:my_attempt_geo
+```
+
+Автор видит агрегированную статистику только если участники дали явный `can_access` на попытки.
+
+### Взаимодействия: где хранятся
+
+| Действие | Где живёт |
+|----------|-----------|
+| Карточка товара | Домовой продавца, публична |
+| Корзина покупателя | Домовой покупателя |
+| Попытка квиза | Домовой участника |
+| Ссылка на публичный узел | Теневая копия в Домовом участника |
+| Рейтинг / отзыв | Домовой автора отзыва, `about` → теневой узел |
+
+Публичный граф остаётся read-only для посетителей. Взаимодействия — в своём графе,
+связанные с теневыми копиями через обычные рёбра.
+
+### Подписка на чужой публичный каталог
+
+Публичный Домовой — частный случай `datasource` без токена аутентификации:
+
+```
+thing:ds_shop_electronics
+  kind: источник-данных
+  type: domovoy
+  endpoint: "https://shop.example.com/pub/electronics-catalog"
+  auth_type: none                         ← публичный, без токена
+```
+
+Использование в ячейке или триггере:
+
+```
+inputs:
+  новые_товары:
+    datasource: thing:ds_shop_electronics
+    query: "SELECT name, price, stock FROM thing WHERE part_of = thing:cat_phones AND stock > 0"
+    format: table
+```
+
+Можно настроить расписание — раз в час синхронизировать публичный каталог в теневое
+пространство и отправлять уведомление если появился интересующий товар.
+
+### Частично публичный граф
+
+Один контейнер публичен, остальное приватно:
+
+```
+thing:домовой_пользователя
+  ├── thing:personal_stuff        ← приватно (нет can_access ← public)
+  ├── thing:work_projects         ← приватно
+  └── thing:pub_container         ← can_access ← thing:public
+        ├── thing:quiz_public     ← наследует публичность контейнера
+        └── thing:catalog_public  ← наследует публичность контейнера
+```
+
+Публичность контейнера не распространяется автоматически — она применяется явно
+к нужным дочерним узлам при выдаче `can_access`. Контейнер как точка входа:
+запрос возвращает только узлы с явным `can_access ← thing:public`.
+
+```surql
+-- Все публичные публикации этого Домового
+SELECT slug, published_at, live,
+       ->about->thing.name AS контент
+FROM thing
+WHERE kind = "публикация"
+  AND ->can_access->thing = thing:public
+ORDER BY published_at DESC;
+
+-- Публичные узлы конкретного контейнера (что видит посетитель)
+SELECT name, kind, price, stock, description
+FROM thing
+WHERE ->part_of->thing = thing:catalog_electronics
+  AND <-can_access<-thing[WHERE id = thing:public] != NONE;
+
+-- Статистика: сколько теневых копий этого каталога у других
+SELECT count() AS реплик
+FROM thing
+WHERE _shadow = true
+  AND _origin_id INSIDE (
+    SELECT id FROM thing WHERE ->part_of->thing = thing:catalog_electronics
+  );
+```
+
 ---
 
 ## Открытые вопросы
