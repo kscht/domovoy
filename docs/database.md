@@ -4530,6 +4530,272 @@ WHERE kind = "задача" AND status = "не начато"
 ORDER BY deadline ASC;
 ```
 
+## Сценарий: интернет-магазин
+
+Расширение небольшой коммерции: варианты товара, корзина, платёжный шлюз, возвраты,
+витрина как публичный граф. Новых рёбер не нужно.
+
+### Структура товара с вариантами
+
+Базовый товар — контейнер. Варианты (цвет, размер, фасовка) — `part_of` него:
+
+```mermaid
+graph TD
+    Product[Браслет макраме\nkind: товар]
+    V1[Вариант: красный\nkind: вариант\nprice: 650\nqty_total: 10\nqty_reserved: 2\nqty_available: 8\nsku: BRC-RED]
+    V2[Вариант: синий\nkind: вариант\nprice: 650\nqty_total: 5\nqty_reserved: 0\nqty_available: 5\nsku: BRC-BLU]
+    V3[Вариант: зелёный\nkind: вариант\nprice: 700\nqty_total: 3\nqty_reserved: 3\nqty_available: 0\nsku: BRC-GRN\nstatus: нет в наличии]
+
+    V1 -->|part_of| Product
+    V2 -->|part_of| Product
+    V3 -->|part_of| Product
+```
+
+Три состояния остатка на каждом варианте:
+
+| Поле | Смысл |
+|------|-------|
+| `quantity_total` | физически есть на складе |
+| `quantity_reserved` | лежат в корзинах (ещё не заказаны) |
+| `quantity_available` | можно купить = total − reserved |
+
+При добавлении в корзину → `quantity_reserved += N`, `quantity_available -= N`.
+При истечении корзины → откат. При оформлении заказа → `used` уменьшает `quantity_total`.
+
+### Корзина
+
+Сессия с позициями. Истекает если не оформлена:
+
+```
+thing:cart_abc123
+  kind: корзина
+  session_id: "abc123"
+  created_at: 2026-05-19T11:00:00Z
+  expires_at: 2026-05-20T11:00:00Z
+  → participant[role: заказчик] → thing:customer_anna   ← если авторизован
+
+thing:cart_item_1
+  kind: позиция-корзины
+  quantity: 2
+  price_snapshot: 650             ← цена зафиксирована в момент добавления
+  → part_of → thing:cart_abc123
+  → about   → thing:variant_bracelet_red
+
+thing:cart_item_2
+  kind: позиция-корзины
+  quantity: 1
+  price_snapshot: 850
+  → part_of → thing:cart_abc123
+  → about   → thing:listing_tomato_seeds
+```
+
+```surql
+-- Освободить резервы истёкших корзин (запускать по расписанию)
+FOR $cart IN (SELECT id FROM thing WHERE kind = "корзина" AND expires_at < time::now()) {
+  FOR $item IN (SELECT * FROM thing WHERE ->part_of->thing = $cart.id) {
+    UPDATE ($item.about) SET
+      quantity_reserved -= $item.quantity,
+      quantity_available += $item.quantity;
+  };
+  DELETE $cart;
+};
+```
+
+### Оформление заказа
+
+Корзина → заказ. Позиции переносятся, корзина удаляется:
+
+```
+thing:order_shop_001
+  kind: заказ
+  status: новый
+  amount: 2150
+  → participant[role: заказчик] → thing:customer_anna
+  → assigned_to                → thing:mom
+  → produces                   → thing:payment_shop_001
+  → produces                   → thing:shipment_shop_001
+
+thing:order_item_1
+  kind: позиция-заказа
+  quantity: 2
+  price: 650
+  → part_of → thing:order_shop_001
+  → about   → thing:variant_bracelet_red
+
+thing:order_item_2
+  kind: позиция-заказа
+  quantity: 1
+  price: 850
+  → part_of → thing:order_shop_001
+  → about   → thing:listing_tomato_seeds
+```
+
+При создании заказа → `quantity_reserved -= N`, `quantity_total` уменьшается через `used` при отправке.
+
+### Платёжный шлюз
+
+```
+thing:payment_shop_001
+  kind: платёж
+  amount: 2150
+  status: ожидает           ← ожидает | оплачен | ошибка | возврат
+  method: СБП               ← СБП | карта | наличные | перевод
+  gateway: тинькофф         ← тинькофф | юкасса | stripe | robokassa
+  gateway_id: "pay_abc123"  ← ID транзакции для сверки в ЛК банка
+  paid_at: datetime
+  → about → thing:order_shop_001
+```
+
+`DEFINE EVENT` при смене `status` на `оплачен` → автоматически переводит заказ в `подтверждён`:
+
+```surql
+DEFINE EVENT payment_confirmed ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND $before.status = "ожидает"
+    AND $value.status = "оплачен"
+    AND $value.kind = "платёж"
+  THEN {
+    UPDATE ($value->about->thing) SET status = "подтверждён";
+  };
+```
+
+### Цикл выполнения заказа
+
+```
+thing:order_shop_001
+  статусы: новый → подтверждён → оплачен → собирается → готов → отправлен → доставлен → выполнен
+
+  → produces → thing:task_pick_001     ← комплектация (assigned_to: мама)
+  → produces → thing:task_pack_001     ← упаковка (depends_on: task_pick)
+  → produces → thing:task_ship_001     ← отправка (depends_on: task_pack)
+  → produces → thing:shipment_001      ← трекинг доставки
+```
+
+При переходе в `отправлен` → `used` списывает товар с остатка:
+
+```surql
+FOR $item IN (SELECT * FROM thing WHERE ->part_of->thing = thing:order_shop_001
+                AND kind = "позиция-заказа") {
+  RELATE thing:order_shop_001->used->($item.about)
+    SET quantity = $item.quantity, unit = "шт";
+  UPDATE ($item.about) SET quantity_total -= $item.quantity;
+};
+```
+
+### Возвраты
+
+```
+thing:return_001
+  kind: возврат
+  status: запрошен          ← запрошен | одобрен | получен | завершён | отклонён
+  reason: "не подошёл цвет"
+  → about   → thing:order_shop_001
+  → about   → thing:order_item_1       ← конкретная позиция
+  → produces → thing:refund_001
+
+thing:refund_001
+  kind: возврат-платежа
+  amount: 650
+  status: ожидает | выполнен
+  gateway_id: "refund_xyz"
+  → about → thing:payment_shop_001
+```
+
+При получении возврата → `quantity_total += N` (товар вернулся на склад).
+
+### Адрес доставки покупателя
+
+```
+thing:address_anna_home
+  kind: адрес
+  city: "Москва"
+  street: "ул. Ленина, 42, кв. 7"
+  postal_code: "101000"
+  → part_of → thing:customer_anna     ← адресная книга покупателя
+
+-- Адрес фиксируется на отправке:
+thing:shipment_shop_001
+  → located_at → thing:address_anna_home   ← адрес доставки
+  carrier: СДЭК
+  tracking_number: "1234567890"
+```
+
+### Витрина: публичный граф магазина
+
+```
+thing:pub_moms_shop
+  kind: публикация
+  slug: "moms-shop"
+  live: true
+  → about → thing:shop_root
+  → can_access ← thing:public
+
+thing:shop_root
+  ├── thing:cat_crafts       name: "Поделки"
+  │     ├── thing:product_bracelet
+  │     └── thing:product_wreath
+  ├── thing:cat_seeds        name: "Семена и саженцы"
+  │     ├── thing:listing_tomato_seeds
+  │     └── thing:listing_saplings_apple
+  └── thing:cat_secondhand   name: "Б/У"
+        └── thing:listing_blender_old
+```
+
+Посетитель без аккаунта видит витрину. При оформлении заказа — создаёт аккаунт
+или оформляет как гость (корзина без `participant`).
+
+### Аналитика магазина
+
+```surql
+-- Выручка по периодам
+SELECT
+  time::floor(created_at, 1w) AS неделя,
+  count() AS заказов,
+  math::sum(amount) AS выручка
+FROM thing
+WHERE kind = "заказ" AND status NOT IN ["отменён", "новый"]
+GROUP BY неделя ORDER BY неделя DESC;
+
+-- Топ товаров по продажам
+SELECT ->about->thing.name AS товар,
+       math::sum(quantity) AS продано,
+       math::sum(quantity * price) AS выручка
+FROM thing
+WHERE kind = "позиция-заказа"
+  AND <-part_of<-thing.status NOT IN ["отменён"]
+GROUP BY ->about->thing
+ORDER BY продано DESC LIMIT 10;
+
+-- Товары с низким остатком
+SELECT name, quantity_total, quantity_reserved, quantity_available,
+       ->part_of->thing.name AS товар
+FROM thing
+WHERE kind = "вариант" AND quantity_available < 3
+ORDER BY quantity_available ASC;
+
+-- Корзины с зависшими резервами (скоро истекут)
+SELECT id, expires_at,
+       math::sum(<-part_of<-thing.quantity) AS позиций
+FROM thing
+WHERE kind = "корзина"
+  AND expires_at < time::now() + 2h
+ORDER BY expires_at ASC;
+
+-- Заказы ожидающие отправки
+SELECT name, status, created_at, amount,
+       ->participant[role = "заказчик"]->thing.name AS покупатель
+FROM thing
+WHERE kind = "заказ" AND status IN ["оплачен", "собирается", "готов"]
+ORDER BY created_at ASC;
+
+-- Открытые возвраты
+SELECT ->about->thing[WHERE kind = "заказ"].name AS заказ,
+       reason, status, created_at
+FROM thing
+WHERE kind = "возврат" AND status NOT IN ["завершён", "отклонён"]
+ORDER BY created_at ASC;
+```
+
 ---
 
 ## Открытые вопросы
