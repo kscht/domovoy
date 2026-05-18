@@ -6613,6 +6613,225 @@ WHERE kind IN ["сервер", "маршрутизатор", "коммутато
 
 ---
 
+## Дашборды, виджеты и отчёты
+
+Дашборд — это граф-узел, который содержит виджеты. Виджет — исполняемый модуль с chart-выводом. Архитектура `inputs` (named SurrealQL queries) уже спроектирована; здесь мы добавляем chart-типы, layout и внешние datasource для телеметрии.
+
+### Новые виды узлов
+
+| kind | что это |
+|------|---------|
+| `дашборд` | коллекция виджетов с layout |
+| `виджет` | единица визуализации — chart, таблица, скаляр |
+| `отчёт` | шаблонный документ с именованными inputs |
+| `снимок-отчёта` | сгенерированный артефакт (produces от отчёта) |
+
+### Виджет как исполняемый модуль
+
+Виджет — это тот же исполняемый модуль из экосистемы notebook/quarto, только с chart-выводом. `inputs` работают ровно так же: named SurrealQL queries или запросы к внешнему datasource.
+
+```yaml
+kind: виджет
+name: "Задачи по статусам"
+chart_type: echarts        # echarts | mermaid | table | scalar | text | map
+position: { x: 0, y: 0, w: 6, h: 4 }   # grid-координаты на дашборде
+config:
+  xAxis: { type: category, data: "{{labels}}" }
+  series:
+    - type: bar
+      data: "{{values}}"
+inputs:
+  labels:
+    source: surreal
+    query: "SELECT status FROM thing WHERE kind='задача' GROUP BY status"
+    format: scalar
+  values:
+    source: surreal
+    query: "SELECT count() AS n FROM thing WHERE kind='задача' GROUP BY status"
+    format: scalar
+```
+
+### Типы chart_type
+
+| chart_type | рендерер | описание |
+|-----------|---------|---------|
+| `echarts` | Apache ECharts | любой chart: bar, line, pie, scatter, heatmap, sankey, graph |
+| `mermaid` | Mermaid.js | flowchart, sequence, gantt, ER — генерируется из SurrealQL |
+| `table` | встроенный | табличные данные с сортировкой и пагинацией |
+| `scalar` | встроенный | одно число / строка (stat panel) с threshold-цветом |
+| `text` | Markdown | статичный или шаблонный текст |
+| `map` | Leaflet / MapLibre | геоданные из `located_at` |
+
+### Телеметрия во внешний datasource
+
+Временны́е ряды (метрики, логи, трейсы) хранятся снаружи — в специализированных хранилищах. Домовой их не дублирует, только ссылается через `kind: источник-данных`.
+
+Новые подтипы `kind: источник-данных`:
+
+| subtype | система |
+|---------|---------|
+| `prometheus` | метрики, PromQL |
+| `victoria-metrics` | метрики, MetricsQL |
+| `influxdb` | метрики, Flux / InfluxQL |
+| `clickhouse` | аналитика, SQL |
+| `loki` | логи, LogQL |
+| `elasticsearch` | поиск / логи, Lucene |
+
+```surql
+-- Узел datasource для Prometheus
+CREATE thing SET
+  kind = "источник-данных",
+  name = "Prometheus home",
+  subtype = "prometheus",
+  url = "http://prometheus.home:9090",
+  about = thing:site_home;
+```
+
+### Мультисource: микс SurrealQL и телеметрии в одном виджете
+
+Виджет может получать данные из разных источников в одном `inputs` — граф и метрики рядом:
+
+```yaml
+kind: виджет
+name: "Нагрузка Proxmox vs активные задачи"
+chart_type: echarts
+inputs:
+  cpu_load:
+    source: thing:ds_prometheus_home
+    query: 'rate(node_cpu_seconds_total{mode!="idle"}[5m]) * 100'
+    format: table
+  active_tasks:
+    source: surreal
+    query: >
+      SELECT time::group(created_at, "1h") AS t, count() AS n
+      FROM thing WHERE kind = "задача" AND status = "активна"
+      GROUP BY t ORDER BY t
+    format: table
+```
+
+### Дашборд
+
+```
+kind: дашборд
+  name: "Инфраструктура дома"
+  contains → kind: виджет  (CPU load)
+  contains → kind: виджет  (Disk usage)
+  contains → kind: виджет  (Активные задачи)
+  contains → kind: виджет  (Инциденты за 30 дней)
+  can_access ← kind: пользователь
+```
+
+```mermaid
+graph TD
+    DB["kind: дашборд\nname: Инфраструктура дома"]
+    W1["kind: виджет\nchart_type: echarts\nname: CPU load"]
+    W2["kind: виджет\nchart_type: scalar\nname: Disk free"]
+    W3["kind: виджет\nchart_type: table\nname: Инциденты"]
+    W4["kind: виджет\nchart_type: mermaid\nname: Топология сети"]
+    DS["kind: источник-данных\nsubtype: prometheus"]
+    SDB[("SurrealDB")]
+
+    DB -->|contains| W1
+    DB -->|contains| W2
+    DB -->|contains| W3
+    DB -->|contains| W4
+    W1 -->|input: cpu_load| DS
+    W2 -->|input: disk| DS
+    W3 -->|input: incidents| SDB
+    W4 -->|input: topology| SDB
+```
+
+### Mermaid из графа
+
+Mermaid-диаграмму можно генерировать прямо из SurrealQL — граф зависимостей задач, сервисов, юридических обжалований:
+
+```surql
+-- Генерация Mermaid flowchart из зависимостей задач
+LET $lines = SELECT
+    in.name + ' --> ' + out.name AS line
+FROM depends_on
+WHERE in.kind = 'задача' AND in ->part_of->thing = thing:project_home;
+
+RETURN "graph TD\n" + array::join($lines.line, "\n");
+```
+
+### Отчёт
+
+```
+kind: отчёт
+  name: "Ежемесячный семейный отчёт"
+  template: |
+    ## {{month}}
+    Задач выполнено: {{done_count}}
+    Расходы: {{expenses}}
+    {{task_chart}}
+  format: pdf           # pdf | html | markdown
+  inputs:
+    done_count: { source: surreal, query: "..." }
+    expenses:   { source: surreal, query: "..." }
+    task_chart: { source: surreal, query: "...", format: echarts }
+  triggered_by → kind: расписание  (monthly)
+  produces → kind: файл             (PDF в vault)
+  about → kind: пользователь        (для кого отчёт)
+```
+
+Снимок отчёта:
+```
+kind: снимок-отчёта
+  generated_at: "2025-05-01T00:00:00Z"
+  format: pdf
+  represents → kind: файл   (физический файл в vault)
+  part_of → kind: отчёт     (шаблон, из которого сгенерирован)
+```
+
+### Дашборд как страница сайта
+
+Дашборд — частный случай `kind: страница` с виджетами вместо текстового контента. Публикуется, шарится и встраивается в любой сайт через уже существующую модель:
+
+```
+kind: страница
+  kind: виджет  (через contains, не через секции)
+  part_of → kind: сайт
+  can_access ← thing:public   ← публичный дашборд
+```
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Все дашборды, доступные текущему пользователю
+SELECT name, created_at,
+       count(<-contains<-thing) AS виджетов
+FROM thing
+WHERE kind = "дашборд"
+  AND (<-can_access<-thing = $auth
+    OR <-can_access<-thing = thing:public)
+ORDER BY created_at DESC;
+
+-- Виджеты дашборда с их источниками
+SELECT name, chart_type, position, inputs
+FROM thing
+WHERE kind = "виджет"
+  AND <-contains<-thing = thing:dashboard_infra;
+
+-- Все отчёты с расписанием и датой последней генерации
+SELECT name, format,
+       ->triggered_by->thing.cron AS расписание,
+       max(->produces->thing.generated_at) AS последний_снимок
+FROM thing
+WHERE kind = "отчёт"
+ORDER BY последний_снимок DESC;
+
+-- Снимки конкретного отчёта
+SELECT generated_at, format,
+       ->represents->thing.path AS файл
+FROM thing
+WHERE kind = "снимок-отчёта"
+  AND ->part_of->thing = thing:report_monthly
+ORDER BY generated_at DESC;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
