@@ -3769,6 +3769,230 @@ WHERE kind = "код"
   AND inputs[*].datasource != NONE;
 ```
 
+## Сценарий: федерация и репликация между инстанциями
+
+### Два режима
+
+| Режим | Пример | Синхронизация |
+|-------|--------|---------------|
+| **Свои дома** | главный дом ↔ дача | двусторонняя, один граф в двух местах |
+| **Чужой Домовой** | Домовой друга | изолированное теневое пространство |
+
+### Инстанция Домового как узел
+
+```
+thing:domovoy_main
+  kind: домовой-инстанция
+  name: "Главный дом"
+  instance_id: "a1b2c3d4"         ← глобально уникальный UUID
+  endpoint: "https://home.local/api"
+  public_key: "ed25519:..."        ← для аутентификации при синхронизации
+  last_sync_at: datetime
+
+thing:domovoy_dacha
+  kind: домовой-инстанция
+  name: "Дача"
+  instance_id: "e5f6g7h8"
+  endpoint: "https://dacha.local/api"
+  public_key: "ed25519:..."
+  last_sync_at: datetime
+```
+
+### Лог изменений
+
+Каждое изменение поля — отдельная запись. Основа всей репликации:
+
+```surql
+DEFINE TABLE change_log SCHEMALESS;
+-- node_id:    запись-источник (thing:*)
+-- operation:  create | update | delete
+-- field:      имя поля (для update)
+-- old_value:  предыдущее значение
+-- new_value:  новое значение
+-- hlc:        Hybrid Logical Clock — строка "физическое_время-счётчик-instance_id"
+-- origin:     thing:domovoy_* — кто сделал изменение
+-- synced_to:  set<record<thing>> — каким инстанциям уже отправлено
+
+DEFINE INDEX idx_log_hlc    ON change_log FIELDS hlc;
+DEFINE INDEX idx_log_origin ON change_log FIELDS origin, hlc;
+DEFINE INDEX idx_log_node   ON change_log FIELDS node_id, field;
+```
+
+**Hybrid Logical Clock (HLC)** — не wall clock, а логические часы с физическим компонентом.
+Устойчивы к расхождению системного времени между домами. Формат:
+`"2026-05-19T10:00:00.000Z-0003-a1b2c3d4"` — время + счётчик + instance_id.
+
+При создании/изменении любого узла — запись в `change_log` автоматически:
+
+```surql
+DEFINE EVENT log_changes ON TABLE thing
+  WHEN $event IN ["CREATE", "UPDATE", "DELETE"]
+  THEN {
+    CREATE change_log SET
+      node_id   = $value.id,
+      operation = $event,
+      hlc       = hlc::now(),           -- функция рантайма
+      origin    = $session.instance_id,
+      new_value = $value,
+      old_value = $before
+    ;
+  };
+```
+
+### Протокол синхронизации (своих домов)
+
+Работает при любом порядке подключения — дача, дом, дача снова:
+
+```
+1. A → B: "мой последний known HLC от тебя: T_last"
+2. B → A: change_log WHERE origin = B AND hlc > T_last
+3. A применяет изменения (merge)
+4. A → B: то же самое в обратную сторону
+5. Оба обновляют last_sync_at
+```
+
+```surql
+-- Изменения которые нужно отправить инстанции thing:domovoy_dacha
+SELECT * FROM change_log
+WHERE hlc > (SELECT last_sync_hlc FROM sync_state WHERE peer = thing:domovoy_dacha)
+  AND origin = thing:domovoy_main
+  AND thing:domovoy_dacha NOT INSIDE synced_to
+ORDER BY hlc ASC;
+```
+
+### Разрешение конфликтов
+
+Конфликт = оба изменили одно поле `node:field` пока были офлайн.
+
+| Ситуация | Правило | Причина |
+|----------|---------|---------|
+| Оба записали одинаковое значение | Нет конфликта, применить | Идемпотентно |
+| Поля разные (разные fields одного node) | Нет конфликта, применить оба | Не пересекаются |
+| `status`: оба продвинули вперёд | Применить наибольший по шкале | Выполнено > в процессе > не начато |
+| `status`: один продвинул, другой откатил | Применить продвинутый (необратимость) | Выполненное не отменяется автоматически |
+| Текстовое поле: оба изменили | LWW по HLC + флаг `has_conflict: true` | Требует внимания |
+| Set-поле (теги, права): оба добавляли | Union (объединение) | Нет конфликта возможно |
+| Set-поле: один добавил, другой удалил | Удаление побеждает (CRDT OR-Set) | Явное действие приоритетнее |
+| Узел удалён на одной, изменён на другой | Сохранить + `deletion_attempted: true` | Пользователь решает |
+
+```surql
+-- Все узлы с неразрешёнными конфликтами
+SELECT id, name, kind, conflict_fields FROM thing
+WHERE has_conflict = true
+ORDER BY updated_at DESC;
+
+-- Детали конфликта по полю
+SELECT field, old_value, new_value, hlc, origin.name AS источник
+FROM change_log
+WHERE node_id = thing:task_1 AND field = "status"
+ORDER BY hlc DESC LIMIT 5;
+```
+
+### Scope репликации
+
+Не всё должно реплицироваться везде:
+
+```
+thing:task_dacha_garden
+  name: "Посадить картошку"
+  replicate_to: [thing:domovoy_dacha]    ← только на дачу
+
+thing:family_budget
+  replicate_to: [thing:domovoy_dacha, thing:domovoy_main]  ← оба дома
+
+thing:personal_diary
+  replicate_to: []                        ← только локально
+```
+
+Контейнер наследует scope дочерним узлам:
+```
+thing:dacha_container
+  replicate_to: [thing:domovoy_dacha]
+  -- все part_of этого контейнера реплицируются на дачу
+```
+
+### Теневое пространство: Домовой друга
+
+Друг дал доступ к части своего графа. Его узлы реплицируются в **изолированное пространство** — не смешиваются с твоими:
+
+```
+thing:shadow__e5f6g7h8__task_abc
+  name: "Починить мотоцикл"              ← данные из графа друга
+  _shadow: true
+  _origin_instance: thing:domovoy_friend
+  _origin_id: "thing:task_abc"           ← оригинальный ID у друга
+  _read_only: true                       ← если доступ только view
+  _synced_at: datetime
+```
+
+Префикс `shadow__<instance_id>__` гарантирует отсутствие коллизий ID.
+
+Ты можешь связывать свои узлы с теневыми через обычные рёбра:
+
+```
+thing:my_task_help_friend
+  name: "Помочь Максу с мотоциклом"
+  → related_to → thing:shadow__e5f6g7h8__task_abc   ← ссылка на его задачу
+  → assigned_to → Папа
+```
+
+```mermaid
+graph TD
+    subgraph Мой граф
+        MyTask[Помочь Максу\nмой узел]
+        MyContact[Макс\nмой контакт]
+    end
+
+    subgraph Теневое пространство Макса
+        ShadowTask[Починить мотоцикл\n_shadow: true\n_read_only: true]
+        ShadowBike[Мотоцикл Макса\n_shadow: true]
+    end
+
+    MyTask -->|related_to| ShadowTask
+    MyTask -->|assigned_to| MyContact
+    ShadowTask -->|about| ShadowBike
+```
+
+**Если друг дал право `edit`** — изменения в теневых узлах пишутся в `change_log`
+с `origin: my_instance` и отправляются другу при следующей синхронизации.
+Друг применяет их с теми же LWW-правилами.
+
+```surql
+-- Все теневые пространства и когда последний раз синхронизировались
+SELECT _origin_instance.name AS домовой,
+       count() AS узлов,
+       max(_synced_at) AS последняя_синхр
+FROM thing
+WHERE _shadow = true
+GROUP BY _origin_instance;
+
+-- Теневые узлы которые изменились у друга с последней синхронизации
+SELECT _origin_id, name, _synced_at FROM thing
+WHERE _shadow = true
+  AND _origin_instance = thing:domovoy_friend
+  AND _synced_at < thing:domovoy_friend.last_sync_at;
+
+-- Мои узлы, связанные с теневыми (зависимости от чужого графа)
+SELECT name, ->related_to->thing[WHERE _shadow = true].name AS теневые_связи
+FROM thing
+WHERE _shadow != true
+  AND count(->related_to->thing[WHERE _shadow = true]) > 0;
+```
+
+### Офлайн-устойчивость
+
+```
+Нет связи между домами:
+  → каждый работает независимо
+  → change_log накапливается локально
+  → при появлении связи: exchange logs, merge, resolve conflicts
+
+Нет интернета совсем:
+  → локальный Домовой работает полностью
+  → теневые пространства не обновляются (данные freeze на момент последней синхр)
+  → datasource с type: domovoy недоступен → fallback на кэш или пустой результат
+```
+
 ---
 
 ## Открытые вопросы
