@@ -427,6 +427,74 @@ SELECT ->part_of<-thing.* FROM thing:root_complaint DEPTH 5;
 
 ---
 
+## Сценарий: медицина — приёмы, назначения, направления
+
+Врач `part_of` больница. Приём — задача с дедлайном. Назначения и направления —
+`produces` из приёма. Следующий приём `about` направление.
+
+```mermaid
+graph TD
+    Patient[Папа]
+    HospA[Городская поликлиника]
+    HospB[Областной центр]
+    Doctor[Врач Иванов]
+
+    Visit1[Приём у Иванова\nstatus: выполнено]
+    Prescription[Назначение: курс лечения]
+    Referral[Направление в областной центр]
+
+    Visit2[Приём в областном центре\ndeadline: до 1 июля\nstatus: ожидает]
+
+    SelfReg[Записаться самим онлайн\nstatus: выполнено]
+    Queue[Встать в очередь у дежурного\nstatus: выполнено]
+    Callback[Ждём звонка от дежурного\ndeadline: 21 мая\nstatus: ожидает]
+    Followup[Позвонить дежурному самим\ndeadline: 22 мая\nstatus: не начато]
+
+    Doctor -->|part_of| HospA
+    Visit1 -->|filed_with| HospA
+    Visit1 -->|about| Doctor
+    Visit1 -->|about| Patient
+    Visit1 -->|produces| Prescription
+    Visit1 -->|produces| Referral
+    Visit1 -->|assigned_to| Patient
+
+    Visit2 -->|about| Referral
+    Visit2 -->|filed_with| HospB
+    Visit2 -->|about| Patient
+    Visit2 -->|assigned_to| Patient
+
+    SelfReg -->|about| Visit2
+    Queue -->|about| Visit2
+    Callback -->|depends_on| Queue
+    Followup -->|depends_on| Callback
+```
+
+**Таймаут на звонок:** `Followup` с дедлайном на следующий день после `Callback` —
+страховка от забывчивости. Уведомление сработает когда дедлайн `Callback` истечёт
+без выполнения.
+
+**OR-логика записи:** два пути к одному приёму (самостоятельно или через дежурного) —
+это поведение приложения. Когда хотя бы один путь сработал, `Visit2` помечается
+подтверждённым. В схеме не формализуется.
+
+```surql
+-- Все предстоящие приёмы у врачей
+SELECT * FROM thing WHERE ->filed_with->thing.name CONTAINS "больниц"
+  AND deadline > time::now() AND status != "выполнено";
+
+-- Назначения и направления из последнего приёма
+SELECT ->produces->thing.* FROM thing:visit_ivanov_may;
+
+-- Незакрытые задачи по ожиданию обратного звонка
+SELECT * FROM thing WHERE name CONTAINS "звонк" AND status = "ожидает"
+  AND deadline < time::now() + 1d;
+
+-- Все приёмы конкретного пациента
+SELECT <-about<-thing[WHERE ->filed_with->thing != NONE].* FROM thing:dad;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
