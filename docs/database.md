@@ -4796,10 +4796,287 @@ WHERE kind = "возврат" AND status NOT IN ["завершён", "откло
 ORDER BY created_at ASC;
 ```
 
+## Сценарий: мессенджеры, email и коммуникационные шлюзы
+
+Шлюз — `thing`. Уведомление — `thing`. Входящее сообщение — `thing`.
+Вся инфраструктура очередей, воркеров, триггеров и datasource уже есть — добавляются только новые `kind`.
+
+### Шлюз как узел
+
+```
+thing:gateway_telegram
+  kind: шлюз
+  type: telegram              ← telegram | whatsapp | email | sms | push | slack
+  name: "Telegram-бот магазина"
+  bot_username: "@moms_shop_bot"
+  → can_access → thing:secret_tg_token
+
+thing:gateway_email_shop
+  kind: шлюз
+  type: email
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  from_address: "shop@example.com"
+  from_name: "Мамин магазин"
+  → can_access → thing:secret_smtp_creds
+
+thing:gateway_sms
+  kind: шлюз
+  type: sms
+  provider: sms_ru
+  → can_access → thing:secret_sms_key
+
+thing:gateway_push
+  kind: шлюз
+  type: push                  ← PWA web push
+  vapid_public: "..."
+  → can_access → thing:secret_vapid_private
+```
+
+### Контактные методы: маршрутизация
+
+Контактные методы покупателя (уже в модели, раздел контакты) управляют выбором шлюза:
+
+```
+thing:customer_anna
+  name: "Анна Козлова"
+
+thing:cm_anna_telegram
+  kind: контакт-метод
+  type: telegram
+  value: "123456789"          ← chat_id для отправки
+  preferred: true             ← предпочтительный канал
+  → part_of → thing:customer_anna
+
+thing:cm_anna_email
+  kind: контакт-метод
+  type: email
+  value: "anna@mail.ru"
+  preferred: false
+  → part_of → thing:customer_anna
+```
+
+Алгоритм маршрутизации: взять `preferred: true`, при ошибке — следующий по порядку.
+Несколько каналов одновременно — если `broadcast: true` на уведомлении.
+
+### Исходящее уведомление
+
+```
+thing:notif_order_shipped_001
+  kind: уведомление
+  text: "Ваш заказ «Браслет красный × 2» отправлен. Трекинг СДЭК: 1234567890"
+  status: ожидает             ← ожидает | отправлено | ошибка | прочитано
+  sent_at: datetime
+  error: null                 ← текст ошибки если status: ошибка
+  broadcast: false
+  → assigned_to → thing:gateway_telegram         ← через какой шлюз
+  → participant[role: получатель] → thing:customer_anna
+  → about       → thing:order_shop_001           ← контекст
+```
+
+Шлюз-модуль берёт `text` + находит `chat_id` по `participant[role: получатель]` → контакт-метод → `value`.
+
+### Шаблоны уведомлений
+
+```
+thing:tmpl_order_shipped
+  kind: шаблон-уведомления
+  channels: [telegram, email]                    ← по каким шлюзам
+  subject: "Заказ отправлен"                     ← для email
+  template_text: |
+    Ваш заказ «{{order.name}}» отправлен.
+    Трекинг {{shipment.carrier}}: {{shipment.tracking_number}}
+    Ожидаемая доставка: {{shipment.estimated_at}}
+  template_html: "<p>...</p>"                    ← для email
+```
+
+Шаблон — входные данные для модуля отправки. Переменные резолвятся через `inputs`-запрос:
+
+```
+inputs:
+  order:    "SELECT name, amount FROM thing WHERE id = $order_id"
+  shipment: "SELECT carrier, tracking_number, estimated_at FROM thing
+             WHERE <-produces<-thing = $order_id AND kind = 'отправка'"
+```
+
+### DEFINE EVENT: автоматическая отправка
+
+```surql
+-- Заказ перешёл в статус "отправлен" → уведомить покупателя
+DEFINE EVENT notify_on_ship ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND $before.status != "отправлен"
+    AND $value.status  =  "отправлен"
+    AND $value.kind    =  "заказ"
+  THEN {
+    LET $customer = (SELECT ->participant[role = "заказчик"]->thing FROM $value.id);
+    CREATE thing SET
+      kind        = "уведомление",
+      status      = "ожидает",
+      created_at  = time::now()
+    ;
+    RELATE $last->about->$value.id;
+    RELATE $last->participant[role = "получатель"]->$customer;
+    RELATE $last->part_of->thing:queue_notifications;
+  };
+
+-- Задача просрочена → уведомить ответственного
+DEFINE EVENT notify_overdue ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND $value.kind     = "задача"
+    AND $value.status  != "выполнено"
+    AND $value.deadline < time::now()
+    AND $before.deadline >= time::now()
+  THEN {
+    LET $assignee = (SELECT ->assigned_to->thing FROM $value.id);
+    CREATE thing SET kind = "уведомление", status = "ожидает",
+      text = string::concat("Задача просрочена: ", $value.name)
+    ;
+    RELATE $last->participant[role = "получатель"]->$assignee;
+    RELATE $last->part_of->thing:queue_notifications;
+  };
+```
+
+### Вебхук: входящие от внешних сервисов
+
+```
+thing:webhook_telegram
+  kind: вебхук
+  path: "/webhooks/telegram"
+  secret_header: "X-Telegram-Bot-Api-Secret-Token"
+  → about   → thing:gateway_telegram
+  → produces → thing:queue_inbound_telegram      ← входящие в очередь
+
+thing:webhook_payment_tinkoff
+  kind: вебхук
+  path: "/webhooks/tinkoff"
+  → about   → thing:gateway_payment_tinkoff
+  → produces → thing:queue_payment_callbacks
+```
+
+Воркер читает очередь, создаёт `kind: входящее-сообщение` и передаёт в AI-пайплайн.
+
+### Входящее сообщение
+
+```
+thing:inbound_tg_001
+  kind: входящее-сообщение
+  source_type: telegram
+  source_chat_id: "123456789"       ← для идентификации отправителя
+  source_message_id: "9876"
+  text: "хочу 2 красных браслета"
+  received_at: 2026-05-19T12:00:00Z
+  → about   → thing:gateway_telegram
+  → produces → thing:task_parse_intent_001
+
+thing:task_parse_intent_001
+  kind: задача
+  status: не начато
+  → assigned_to → thing:ai_claude
+  → about       → thing:inbound_tg_001
+  → produces    → thing:order_draft_001         ← AI создаёт черновик заказа
+```
+
+При получении сообщения — определить отправителя по `source_chat_id` → `контакт-метод` → `покупатель`. Если не найден — создать нового или попросить представиться.
+
+### Email как источник данных (IMAP)
+
+Письма-триггеры обрабатываются как datasource:
+
+```
+thing:ds_email_cdek
+  kind: источник-данных
+  type: imap
+  host: "imap.gmail.com"
+  folder: "INBOX"
+  filter: "from:noreply@cdek.ru OR from:pochta@russianpost.ru"
+  poll_interval: 300            ← секунд между проверками
+  → can_access → thing:secret_imap_creds
+
+thing:trigger_tracking_email
+  kind: триггер
+  event_type: new_message
+  → about   → thing:ds_email_cdek
+  → produces → thing:queue_ai_light             ← AI парсит письмо → обновляет трекинг
+```
+
+### Conversational bot: диалог через мессенджер
+
+Полный цикл: пользователь пишет → AI разбирает → отвечает через тот же шлюз:
+
+```mermaid
+graph TD
+    User[Покупатель в Telegram]
+    Inbound[Входящее сообщение\ntext: где мой заказ]
+    Q[Очередь inbound_tg]
+    AI[ai_claude\nклассификация намерения]
+    Order[Заказ #001\nstatus: отправлен]
+    Notif[Уведомление-ответ\nТрекинг: 12345...]
+    GW[gateway_telegram]
+    User2[Пользователь получает ответ]
+
+    User -->|пишет| Inbound
+    Inbound -->|part_of| Q
+    Q -->|воркер| AI
+    AI -->|about| Order
+    AI -->|produces| Notif
+    Notif -->|assigned_to| GW
+    GW -->|отправляет| User2
+```
+
+Состояние диалога — цепочка `входящее → ответ → входящее`:
+
+```
+thing:dialog_anna_001
+  kind: диалог
+  → part_of → thing:customer_anna
+
+thing:inbound_tg_001  → part_of → thing:dialog_anna_001  (order: 1)
+thing:notif_reply_001 → part_of → thing:dialog_anna_001  (order: 2)
+thing:inbound_tg_002  → part_of → thing:dialog_anna_001  (order: 3)
+```
+
+### SurrealQL: мониторинг коммуникаций
+
+```surql
+-- Уведомления в очереди (ожидают отправки)
+SELECT text, ->participant[role = "получатель"]->thing.name AS кому,
+       ->assigned_to->thing.name AS шлюз,
+       created_at
+FROM thing
+WHERE kind = "уведомление" AND status = "ожидает"
+ORDER BY created_at ASC;
+
+-- Ошибки доставки за последние 24 часа
+SELECT text, error,
+       ->participant[role = "получатель"]->thing.name AS кому,
+       ->assigned_to->thing.name AS шлюз
+FROM thing
+WHERE kind = "уведомление" AND status = "ошибка"
+  AND created_at > time::now() - 24h;
+
+-- Необработанные входящие сообщения
+SELECT source_type, source_chat_id, text, received_at
+FROM thing
+WHERE kind = "входящее-сообщение"
+  AND count(->produces->thing[WHERE status != "выполнено"]) > 0
+ORDER BY received_at ASC;
+
+-- Статистика по шлюзам: сколько отправлено / ошибок
+SELECT ->assigned_to->thing.name AS шлюз,
+       count() AS всего,
+       count(status = "отправлено") AS успешно,
+       count(status = "ошибка") AS ошибок
+FROM thing
+WHERE kind = "уведомление"
+  AND created_at > time::now() - 7d
+GROUP BY ->assigned_to->thing;
+```
+
 ---
 
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
 - [ ] Повторяющиеся задачи — шаблон с расписанием (каждую субботу, каждые 10000 км)?
-- [ ] Уведомления — push или только в приложении?
+- [x] Уведомления — push или только в приложении? → шлюз `kind: push` + другие каналы
