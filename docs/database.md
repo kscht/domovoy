@@ -5826,6 +5826,203 @@ WHERE kind = "telegram-сообщение"
 ORDER BY sent_at DESC;
 ```
 
+## Сценарий: граф как источник истины для веб-сайта
+
+Тот же паттерн что и Telegram-канал: граф — источник, сайт — живая проекция.
+Редактируешь узел → страница пересобирается автоматически.
+
+### Параллель с Telegram
+
+| Telegram | Веб-сайт |
+|----------|----------|
+| `kind: telegram-сообщение` + `message_id` | `kind: страница` + `slug` |
+| `reply_to_message_id` | вложенная секция / дочерняя страница |
+| `editMessageText` | перезаписать HTML в vault / сбросить кэш |
+| `sendMessage` | создать новую страницу |
+| `deleteMessage` | убрать страницу, вернуть 404 или редирект |
+| топик (`thread_id`) | раздел сайта / категория |
+| шаблон публикации | layout + шаблон рендера |
+
+### Привязка: узел `produces` страницу
+
+```
+thing:recipe_borsch
+  → produces → thing:page_borsch
+
+thing:page_borsch
+  kind: страница
+  slug: "recipes/borsch"
+  render_mode: ssg
+  built_file: "file_id_html"         ← готовый HTML в vault
+  built_at: 2026-05-19T10:00:00Z
+  cache_key: "recipe_borsch_v3"
+  seo_title: "Борщ классический | Кулинарный блог"
+  seo_description: "Настоящий украинский борщ..."
+  → about → thing:recipe_borsch      ← обратная ссылка
+  → part_of → thing:site_cooking
+```
+
+Один узел может питать несколько проекций одновременно:
+
+```
+thing:recipe_borsch
+  → produces → thing:page_borsch          ← страница сайта
+  → produces → thing:tg_msg_borsch_main   ← пост в Telegram
+  → produces → thing:post_ig_borsch       ← пост в Instagram
+```
+
+Изменил рецепт — все три проекции обновляются из одного источника.
+
+### DEFINE EVENT: автопересборка
+
+```surql
+DEFINE EVENT sync_to_web ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND count(->produces->thing[WHERE kind = "страница"]) > 0
+  THEN {
+    LET $pages = SELECT * FROM ->produces->thing WHERE kind = "страница";
+    FOR $page IN $pages {
+      CREATE thing SET
+        kind       = "задание",
+        operation  = "rebuild_page",
+        node_id    = $value.id,
+        page_id    = $page.id,
+        slug       = $page.slug,
+        created_at = time::now()
+      ;
+      RELATE $last->part_of->thing:queue_web_rebuild;
+    };
+  };
+```
+
+Воркер берёт задание → рендерит узел по шаблону через `inputs`-запрос →
+записывает HTML в vault → сбрасывает CDN-кэш по `cache_key`.
+
+### Инкрементальная пересборка: только изменённое поддерево
+
+Главное преимущество перед статическим генератором: не пересобирать весь сайт.
+Изменился один рецепт → пересобирается только его страница.
+
+```
+thing:recipe_borsch  (изменён)
+  → produces → thing:page_borsch              ← пересобрать
+  → part_of  → thing:category_soups
+               → produces → thing:page_soups  ← пересобрать список (изменился дочерний)
+
+НЕ пересобирать:
+  thing:page_home         (если нет блока "последние рецепты")
+  thing:page_about
+  все остальные рецепты
+```
+
+Зависимости пересборки — отдельный граф `invalidates`:
+
+```
+thing:page_borsch →invalidates→ thing:page_soups   ← список категории
+thing:page_borsch →invalidates→ thing:page_sitemap  ← карта сайта
+```
+
+```surql
+-- Все страницы которые нужно пересобрать при изменении узла
+SELECT id, slug FROM thing
+WHERE kind = "страница"
+  AND (
+    <-produces<-thing = thing:recipe_borsch
+    OR <-invalidates<-thing = thing:page_borsch
+  );
+```
+
+### Иерархия: граф → структура страницы
+
+`part_of` в графе → секции и подсекции на странице в порядке `order`:
+
+```
+thing:recipe_borsch                          ← страница целиком
+  ├── thing:section_intro    (order: 1)      ← секция "Введение"
+  ├── thing:section_ingr     (order: 2)      ← секция "Ингредиенты"
+  │     ├── thing:ingr_beet  (order: 1)      ← строка таблицы
+  │     └── thing:ingr_beef  (order: 2)
+  ├── thing:section_steps    (order: 3)      ← секция "Шаги"
+  │     ├── thing:step_1     (order: 1)
+  │     └── thing:step_2     (order: 2)
+  └── thing:section_tips     (order: 4)      ← секция "Советы"
+```
+
+Каждый `kind` рендерится по своему шаблону — те же `kind: шаблон-публикации`
+что и для Telegram, но выводят HTML вместо Markdown.
+
+### Шаблон рендера (HTML)
+
+```
+thing:tmpl_recipe_html
+  kind: шаблон-публикации
+  platform: web
+  applies_to_kind: рецепт
+  layout: article-wide
+  inputs:
+    рецепт:
+      query: "SELECT name, description, cook_time, servings FROM thing WHERE id = $node_id"
+      format: table
+    секции:
+      query: "SELECT id, kind, name FROM thing WHERE ->part_of->thing = $node_id ORDER BY ->part_of.order"
+      format: table
+    теги:
+      query: "SELECT name FROM thing WHERE <-related_to<-thing = $node_id"
+      format: table
+  template_file: "file_id_recipe_html_tmpl"  ← Jinja2 / Handlebars в vault
+```
+
+### Один граф — много проекций одновременно
+
+```mermaid
+graph TD
+    Graph[Граф рецептов\nтип исины]
+
+    Web[Веб-сайт\nSSG/ISR]
+    TG[Telegram-канал\nтреды]
+    IG[Instagram\nпосты + reels]
+    PDF[PDF-книга\nэкспорт]
+    RSS[RSS-лента\nподписчики]
+
+    Graph -->|produces + rebuild| Web
+    Graph -->|produces + editMessage| TG
+    Graph -->|produces + update| IG
+    Graph -->|produces + re-export| PDF
+    Graph -->|produces + ping| RSS
+```
+
+Каждая проекция — воркер со своим шаблоном и протоколом вывода.
+Новый канал распространения = новый воркер, граф не меняется.
+
+### SurrealQL: мониторинг состояния сайта
+
+```surql
+-- Страницы устаревшие после изменений в графе (built_at < updated_at источника)
+SELECT slug, built_at,
+       ->about->thing.updated_at AS источник_изменён,
+       built_at < ->about->thing.updated_at AS устарела
+FROM thing
+WHERE kind = "страница"
+ORDER BY устарела DESC, ->about->thing.updated_at DESC;
+
+-- Очередь пересборки: что ждёт
+SELECT slug, created_at,
+       time::now() - created_at AS ожидает
+FROM thing
+WHERE kind = "задание" AND operation = "rebuild_page" AND status = "ожидает"
+ORDER BY created_at ASC;
+
+-- Узлы без веб-проекции (не опубликованы на сайте)
+SELECT name, kind FROM thing
+WHERE kind IN ["рецепт", "пост", "страница-контента"]
+  AND count(->produces->thing[WHERE kind = "страница"]) = 0;
+
+-- Все проекции одного узла (куда опубликован)
+SELECT ->produces->thing.kind AS тип, ->produces->thing.slug AS slug,
+       ->produces->thing.built_at AS обновлено
+FROM thing WHERE id = thing:recipe_borsch;
+```
+
 ---
 
 ## Открытые вопросы
