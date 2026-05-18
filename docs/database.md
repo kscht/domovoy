@@ -5073,6 +5073,273 @@ WHERE kind = "уведомление"
 GROUP BY ->assigned_to->thing;
 ```
 
+## Сценарий: дневник, блог и веб-сайт
+
+Дневник — приватный граф без `can_access ← thing:public`.
+Блог — документы с SEO-полями и публичным доступом.
+Сайт — `kind: сайт` со страницами, навигацией и динамическими блоками.
+Рендеринг читает граф и отдаёт HTML — тот же Next.js, что и для Домового.
+
+### Дневник
+
+Контейнер без публичного доступа. Записи — стандартные блоковые документы:
+
+```
+thing:diary_mom
+  kind: дневник
+  name: "Личный дневник"
+  -- нет can_access ← thing:public → только владелец
+
+thing:diary_entry_20260519
+  kind: запись-дневника
+  created_at: 2026-05-19T09:00:00Z
+  mood: радостно               ← произвольные поля настроения
+  weather: солнечно
+  → part_of   → thing:diary_mom
+  → related_to → thing:tag_garden   (label: тег)
+  → related_to → thing:tag_spring
+
+-- Текст — обычные блоки внутри записи:
+thing:block_diary_1  text: "Сегодня посадила первую рассаду..."
+  → part_of → thing:diary_entry_20260519  (order: 1)
+thing:block_diary_2  text: "Антоновка дала первые почки."
+  → part_of → thing:diary_entry_20260519  (order: 2)
+```
+
+Записи связываются с любыми узлами графа через `about`:
+
+```
+thing:diary_entry_20261001
+  → about → thing:order_sapling_apple   ← запись в день отправки саженцев
+  → about → thing:customer_petr
+```
+
+Хронология и поиск:
+
+```surql
+-- Записи за последний месяц
+SELECT name, created_at, mood,
+       array::group(->related_to->thing.name) AS теги
+FROM thing
+WHERE kind = "запись-дневника"
+  AND created_at > time::now() - 30d
+ORDER BY created_at DESC;
+
+-- Записи связанные с конкретным объектом
+SELECT created_at, ->part_of->thing[WHERE kind != "запись-дневника"].text AS фрагмент
+FROM thing
+WHERE kind = "блок" AND ->part_of->thing->about->thing = thing:apple_tree_antonovka
+ORDER BY created_at DESC;
+```
+
+### Блог
+
+Пост — документ с дополнительными полями для веба. `can_access ← thing:public` делает его публичным:
+
+```
+thing:blog_section
+  kind: блог
+  name: "Блог о саде и рукоделии"
+  slug: "blog"
+  → part_of → thing:site_moms_shop
+
+thing:post_tomato_seeds
+  kind: пост
+  title: "Как сохранить семена томатов до весны"
+  slug: "kak-sohranit-semena-tomatov"
+  published_at: 2026-05-01T10:00:00Z
+  status: черновик | опубликован | архив
+  featured_image: "file_id_cover"       ← ID файла в vault
+  excerpt: "Правильное хранение семян — залог хорошего урожая..."
+  seo_title: "Как сохранить семена томатов | Мамин сад"
+  seo_description: "Подробное руководство по сбору и хранению..."
+  seo_image: "file_id_og"
+  → part_of   → thing:blog_section
+  → related_to → thing:tag_seeds    (label: тег)
+  → related_to → thing:tag_tomatoes
+  → about      → thing:listing_tomato_seeds   ← ссылка на товар в магазине
+  → can_access ← thing:public
+
+-- Блоки поста — обычная блоковая структура:
+thing:block_post_1  kind: заголовок  text: "Когда собирать семена"
+  → part_of → thing:post_tomato_seeds  (order: 1)
+thing:block_post_2  kind: текст  text: "Дождитесь полного созревания..."
+  → part_of → thing:post_tomato_seeds  (order: 2)
+thing:block_post_3  kind: изображение  → represents → thing:file_photo_seeds
+  → part_of → thing:post_tomato_seeds  (order: 3)
+```
+
+Комментарии — уже в модели (раздел "Обсуждения"):
+
+```
+thing:comment_vasya
+  text: "Спасибо! А как долго хранятся?"
+  → about → thing:post_tomato_seeds
+  → assigned_to → thing:person_vasya
+```
+
+### Сайт
+
+```
+thing:site_moms_shop
+  kind: сайт
+  name: "Мамин магазин и сад"
+  domain: "moms-shop.ru"
+  lang: ru
+  → can_access ← thing:public
+```
+
+Страницы — `part_of` сайта:
+
+```
+thing:page_home
+  kind: страница
+  slug: ""               ← корень
+  title: "Главная"
+  layout: fullwidth
+  seo_title: "Мамин магазин — поделки, семена, саженцы"
+  seo_description: "..."
+  → part_of → thing:site_moms_shop
+  → can_access ← thing:public
+
+thing:page_catalog
+  kind: страница
+  slug: "catalog"
+  title: "Каталог"
+  layout: sidebar
+  → part_of → thing:site_moms_shop
+  → can_access ← thing:public
+
+thing:page_about
+  kind: страница
+  slug: "about"
+  title: "О нас"
+  layout: article
+  → part_of → thing:site_moms_shop
+  → can_access ← thing:public
+```
+
+### Навигация
+
+```
+thing:nav_main
+  kind: навигация
+  name: "Основное меню"
+  → part_of → thing:site_moms_shop
+
+thing:nav_home     name: "Главная"   order: 1  → about → thing:page_home
+thing:nav_catalog  name: "Магазин"   order: 2  → about → thing:page_catalog
+thing:nav_blog     name: "Блог"      order: 3  → about → thing:blog_section
+thing:nav_about    name: "О нас"     order: 4  → about → thing:page_about
+
+-- Всё part_of thing:nav_main (order уже на узле)
+```
+
+### Динамические блоки на странице
+
+Страница сочетает статические текстовые блоки и динамические — с запросом к графу.
+Динамический блок = код-ячейка (уже в модели) с `template` вместо `source`:
+
+```
+-- Главная страница:
+thing:block_hero       kind: текст       text: "Привет! Я делаю поделки..."
+  → part_of → thing:page_home  (order: 1)
+
+thing:block_featured   kind: блок-динамический
+  template: "product-grid"
+  inputs:
+    товары:
+      query: "SELECT name, price, featured_image, slug FROM thing
+              WHERE kind = 'товар' AND featured = true
+              ORDER BY updated_at DESC LIMIT 6"
+      format: table
+  → part_of → thing:page_home  (order: 2)
+
+thing:block_latest_posts  kind: блок-динамический
+  template: "post-list"
+  inputs:
+    посты:
+      query: "SELECT title, slug, excerpt, published_at, featured_image
+              FROM thing WHERE kind = 'пост' AND status = 'опубликован'
+              ORDER BY published_at DESC LIMIT 3"
+      format: table
+  → part_of → thing:page_home  (order: 3)
+```
+
+Рендерер читает `template` → вызывает модуль-рендера → получает HTML-фрагмент.
+Тот же протокол, что у Mermaid/Observable/SQL-рендеров (уже в модели).
+
+### SSG vs SSR
+
+| Режим | Как | Когда |
+|-------|-----|-------|
+| **SSG** (статика) | при публикации выполнить все динамические блоки, сохранить HTML в vault | редко меняющийся контент |
+| **SSR** | запрос к графу при каждом HTTP-запросе | цены, остатки, живой каталог |
+| **ISR** | SSG + фоновое обновление по расписанию | блог, каталог с умеренным трафиком |
+
+```
+thing:page_catalog
+  render_mode: ssr             ← цены и остатки всегда актуальны
+
+thing:page_about
+  render_mode: ssg
+  built_at: 2026-05-19T10:00:00Z
+  built_file: "file_id_html"   ← готовый HTML в vault
+```
+
+### Полная картина: дневник + блог + магазин на одном графе
+
+```mermaid
+graph TD
+    Site[Сайт: moms-shop.ru]
+
+    PHome[Страница: Главная]
+    PCat[Страница: Каталог]
+    PAbout[Страница: О нас]
+    Blog[Блог\nкind: блог]
+
+    Post1[Пост: Семена томатов\nопубликован\npublic]
+    Post2[Пост: Осенние саженцы\nчерновик]
+
+    Shop[Каталог магазина\nkind: публикация]
+    Product[Браслет макраме\nkind: товар]
+
+    Diary[Дневник\nприватно]
+    Entry1[Запись 19 мая]
+
+    PHome -->|part_of| Site
+    PCat  -->|part_of| Site
+    PAbout -->|part_of| Site
+    Blog  -->|part_of| Site
+    Post1 -->|part_of| Blog
+    Post2 -->|part_of| Blog
+    Post1 -->|about| Product
+    Shop  -->|about| Product
+    Entry1 -->|part_of| Diary
+    Entry1 -->|about| Product
+```
+
+```surql
+-- Все опубликованные посты с тегами
+SELECT title, slug, published_at, excerpt,
+       array::group(->related_to->thing.name) AS теги
+FROM thing
+WHERE kind = "пост" AND status = "опубликован"
+ORDER BY published_at DESC;
+
+-- Страницы сайта с режимом рендера
+SELECT title, slug, render_mode, built_at,
+       count(<-part_of<-thing[WHERE kind = "блок-динамический"]) AS динамических_блоков
+FROM thing
+WHERE kind = "страница" AND ->part_of->thing = thing:site_moms_shop
+ORDER BY slug;
+
+-- Посты связанные с товарами (для перелинковки)
+SELECT p.title AS пост, t.name AS товар, t.slug AS slug_товара
+FROM thing AS p, thing AS t
+WHERE p.kind = "пост" AND p->about->thing = t AND t.kind = "товар";
+```
+
 ---
 
 ## Открытые вопросы
