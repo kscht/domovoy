@@ -3392,6 +3392,234 @@ FROM thing
 WHERE kind = "автовыключатель" AND status = "открыт";
 ```
 
+## Сценарий: внешние модули через REST API и источники данных
+
+### REST API контракт модуля
+
+Любой внешний модуль — это HTTP-сервис с единым контрактом.
+Рантайм вызывает его POST-запросом, передаёт готовые данные, получает результат:
+
+```
+POST http://module-host/execute
+Content-Type: application/json
+
+{
+  "inputs": {
+    "расходы": [                      ← результат SurrealQL-запроса
+      {"name": "Молоко", "amount": 98},
+      {"name": "Хлеб",   "amount": 45}
+    ],
+    "порог": 500                      ← scalar
+  },
+  "output_node": "thing:output_123",  ← куда записать результат
+  "job_id": "thing:job_456"           ← для статуса и логов
+}
+
+→ 200 OK
+{
+  "status": "ok",
+  "result": { ... }                   ← рантайм запишет в output_node
+}
+```
+
+Модуль не знает про SurrealDB — он получает готовые данные и возвращает результат.
+Язык реализации, рантайм, платформа — произвольные.
+
+```
+thing:module_budget_analyzer
+  kind: внешний-модуль
+  endpoint: "http://localhost:7001/execute"
+  handles: [python]
+  → expert_in → thing:lang_python
+
+thing:module_chart_renderer
+  kind: внешний-модуль
+  endpoint: "http://chart-service.local/execute"
+  handles: [vega, plotly]
+```
+
+### DataSource: универсальный источник данных
+
+`datasource` расширяет протокол `inputs` — вместо SurrealQL-запроса к локальному графу
+можно обратиться к любому внешнему источнику через единый системный модуль-коннектор.
+
+```
+thing:ds_home_assistant
+  kind: источник-данных
+  type: rest
+  base_url: "http://homeassistant.local:8123/api"
+  auth_type: bearer
+  → can_access → thing:secret_ha_token
+
+thing:ds_postgres
+  kind: источник-данных
+  type: sql
+  driver: postgresql
+  endpoint: "postgresql://localhost:5432/home_db"
+  → can_access → thing:secret_pg_creds
+
+thing:ds_granny_domovoy
+  kind: источник-данных
+  type: domovoy
+  endpoint: "https://granny.local/api"
+  → can_access → thing:secret_granny_key
+```
+
+Поддерживаемые типы:
+
+| `type` | Протокол | Формат запроса |
+|--------|----------|----------------|
+| `domovoy` | SurrealQL over HTTP | SurrealQL строка |
+| `rest` | HTTP REST | path + method + params |
+| `sql` | SQL (postgres/sqlite/mysql) | SQL строка |
+| `graphql` | GraphQL | GraphQL query |
+| `surreal` | SurrealDB напрямую | SurrealQL строка |
+| `file` | Локальный/remote файл | путь + формат |
+| `mqtt` | MQTT subscribe | topic-паттерн |
+
+### Расширенный протокол inputs
+
+Ячейка может смешивать локальные запросы и внешние источники:
+
+```
+thing:cell_ha_report
+  kind: код
+  language: python
+  inputs:
+    температура:
+      datasource: thing:ds_home_assistant    ← внешний REST
+      path: "/states/sensor.living_room_temperature"
+      method: GET
+      format: scalar
+
+    движение:
+      datasource: thing:ds_home_assistant
+      path: "/states/binary_sensor.motion_hall"
+      method: GET
+      format: scalar
+
+    задачи_дома:
+      query: "SELECT name, status FROM thing WHERE kind = 'задача' AND status != 'выполнено'"
+      format: table                          ← локальный граф
+
+    норма_температуры:
+      datasource: thing:ds_postgres          ← внешняя SQL БД
+      sql: "SELECT value FROM settings WHERE key = 'temp_norm'"
+      format: scalar
+
+  source: "make_report(температура, движение, задачи_дома, норма_температуры)"
+  → requires → thing:runtime_python
+  → produces → thing:output_ha_report
+```
+
+Если указан `datasource` — рантайм маршрутизирует запрос через системный коннектор.
+Если указан `query` — выполняет локально в SurrealDB. Результат всегда одинаковый.
+
+### Системный модуль-коннектор
+
+Встроенный модуль, который знает как говорить с каждым типом источника:
+
+```
+thing:module_datasource_connector
+  kind: системный-модуль
+  name: "DataSource Connector"
+  endpoint: "http://localhost:9000/execute"
+  handles: [domovoy, rest, sql, graphql, file, mqtt]
+```
+
+Коннектор:
+1. Читает определение `datasource` из графа
+2. Забирает credentials через `can_access` → secrets
+3. Выполняет запрос в нужном протоколе
+4. Возвращает результат в унифицированном формате
+5. Кэширует если указан `cache_ttl`
+
+### Пример: Home Assistant → задача по температуре
+
+Триггер по расписанию — раз в 5 минут проверяет датчики и создаёт задачу при отклонении:
+
+```
+thing:trigger_temp_check
+  kind: расписание
+  cron: "*/5 * * * *"
+  → produces → thing:queue_ai_light
+
+-- Пайплайн:
+thing:step_fetch_temp
+  kind: шаг
+  inputs:
+    temp:
+      datasource: thing:ds_home_assistant
+      path: "/states/sensor.boiler_temperature"
+      format: scalar
+  → assigned_to → thing:module_datasource_connector
+
+thing:step_decide
+  kind: шаг
+  inputs:
+    temp:
+      query: "SELECT result.temp FROM thing:step_fetch_temp->produces->thing"
+      format: scalar
+    threshold:
+      query: "SELECT value FROM thing WHERE name = 'Порог температуры котла'"
+      format: scalar
+  source: "if temp < threshold: create_task('Проверить котёл')"
+  → assigned_to → thing:ai_claude
+  → depends_on  → thing:step_fetch_temp
+```
+
+### Федерация между инстанциями Домового
+
+Несколько домов — каждый со своим Домовым, данные объединяются по запросу:
+
+```mermaid
+graph TD
+    Home[Домовой: наш дом]
+    Granny[Домовой: бабушка\ngranny.local]
+    Dacha[Домовой: дача\ndacha.local]
+
+    DS_G[ds_granny_domovoy\ntype: domovoy]
+    DS_D[ds_dacha_domovoy\ntype: domovoy]
+
+    Home -->|can_access| DS_G
+    Home -->|can_access| DS_D
+```
+
+```
+thing:cell_family_health
+  inputs:
+    наши_визиты:
+      query: "SELECT name, date FROM thing WHERE kind = 'приём' ORDER BY date DESC LIMIT 5"
+      format: table
+
+    бабушкины_визиты:
+      datasource: thing:ds_granny_domovoy
+      query: "SELECT name, date FROM thing WHERE kind = 'приём' ORDER BY date DESC LIMIT 5"
+      format: table
+```
+
+Данные бабушки остаются у неё. Мы запрашиваем только то, на что есть `can_access`.
+
+```surql
+-- Все зарегистрированные источники данных
+SELECT name, type, endpoint FROM thing
+WHERE kind = "источник-данных"
+ORDER BY type, name;
+
+-- Источники с истёкшими или отсутствующими credentials
+SELECT name, type, endpoint
+FROM thing
+WHERE kind = "источник-данных"
+  AND count(->can_access->thing) = 0;
+
+-- Все ячейки, использующие внешние источники (не только локальный граф)
+SELECT name, language,
+       ->part_of->thing.name AS документ
+FROM thing
+WHERE kind = "код"
+  AND inputs[*].datasource != NONE;
+```
+
 ---
 
 ## Открытые вопросы
