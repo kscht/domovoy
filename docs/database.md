@@ -2770,6 +2770,103 @@ WHERE ->part_of->thing = thing:contract_fence
 ORDER BY deadline ASC;
 ```
 
+## Сценарий: wiki и документация
+
+Темы, страницы, блоки — всё `thing`. Иерархия и теги — через уже существующие рёбра.
+
+### Иерархия тем
+
+```mermaid
+graph TD
+    Root[Домовая wiki]
+    Vehicles[Транспорт]
+    Moto[Мотоцикл]
+    House[Дом]
+    Health[Здоровье]
+
+    Vehicles -->|part_of| Root
+    Moto -->|part_of| Vehicles
+    House -->|part_of| Root
+    Health -->|part_of| Root
+```
+
+Тема — просто `thing` с `name`. Вложенность — `part_of`. Глубина произвольная.
+
+### Документ и его блоки
+
+```
+thing:doc_to_guide
+  name: "Регламент ТО мотоцикла"
+  kind: документ
+  → part_of → thing:topic_moto       ← основная тема
+
+thing:block_1  text: "Менять масло каждые 10 000 км"  → part_of → thing:doc_to_guide  (order: 1)
+thing:block_2  text: "Фильтр воздушный — каждые 5 ТО" → part_of → thing:doc_to_guide  (order: 2)
+thing:block_3  text: "Цепь: смазка каждые 500 км"     → part_of → thing:doc_to_guide  (order: 3)
+```
+
+Блок — минимальная единица переиспользования. Его можно транскюзировать в другой документ через ребро `references` (режим `live` или `snapshot`).
+
+### Три роли связей от документа
+
+| Ребро | Смысл |
+|-------|-------|
+| `part_of → тема` | документ принадлежит теме (основная иерархия) |
+| `related_to → тема` | документ также про эту тему (дополнительный тег) |
+| `about → вещь` | документ про конкретный объект системы |
+
+```
+thing:doc_winter_prep  name: "Подготовка мотоцикла к зиме"
+  → part_of   → thing:topic_moto        ← основная тема
+  → related_to → thing:topic_storage    ← дополнительная тема
+  → about      → thing:moto_bmw         ← конкретная вещь
+```
+
+### Связь документации с объектами системы
+
+Любой `thing` (мотоцикл, лекарство, договор, рецепт) может иметь прикреплённые документы через `about`:
+
+```surql
+-- Вся документация по мотоциклу
+SELECT name FROM thing
+WHERE ->about->thing = thing:moto_bmw;
+
+-- Все документы в теме "Мотоцикл" включая подтемы
+SELECT name FROM thing
+WHERE ->part_of->thing = thing:topic_moto
+  OR ->related_to->thing = thing:topic_moto;
+
+-- Полное дерево тем с количеством документов
+SELECT name,
+       count(<-part_of<-thing[WHERE kind = "документ"]) AS документов
+FROM thing
+WHERE ->part_of->thing = thing:wiki_root
+ORDER BY name ASC;
+```
+
+### Перекрёстные ссылки между документами
+
+```
+thing:block_oil_tip  text: "Масло 10W-40, не менее 3.5 л"
+  → part_of → thing:doc_to_guide      ← живёт в регламенте ТО
+
+-- В инструкции по зимнему хранению тот же блок транскюзирован:
+thing:ref_oil  → references → thing:block_oil_tip  (mode: live)
+thing:ref_oil  → part_of    → thing:doc_winter_prep  (order: 4)
+```
+
+Блок редактируется в одном месте, отображается везде где транскюзирован.
+
+### Корневые контейнеры wiki
+
+```
+thing:wiki_root    name: "Wiki"        ← корень всего дерева
+thing:topic_moto   name: "Мотоцикл"   → part_of → thing:wiki_root
+thing:topic_house  name: "Дом"        → part_of → thing:wiki_root
+thing:topic_health name: "Здоровье"   → part_of → thing:wiki_root
+thing:topic_family name: "Семья"      → part_of → thing:wiki_root
+```
+
 ---
 
 ## Открытые вопросы
