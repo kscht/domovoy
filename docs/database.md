@@ -121,12 +121,14 @@ SELECT * FROM thing WHERE status = "в процессе" AND template != true;
 | `represents` | Цифровая копия → физический оригинал | — |
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
-| `references` | Блок ссылается на другой блок с режимом включения | `mode`, `snapshot_text`, `snapshot_at` |
+| `references` | Блок ссылается на другой блок с режимом включения | `mode`, `source_file`, `anchor`, `snapshot_text`, `snapshot_at` |
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
 **`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
 **`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`  
-**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации
+**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации  
+**`source_file` на ребре `references`:** имя `.md` файла внутри директории цели — для трансклюзии целого файла или секции без `thing`-узла  
+**`anchor` на ребре `references`:** якорь `^id` внутри файла — для трансклюзии конкретной секции
 
 ---
 
@@ -751,6 +753,8 @@ DEFINE FIELD label ON related_to TYPE string;
 
 DEFINE TABLE references TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD mode          ON references TYPE string;
+DEFINE FIELD source_file   ON references TYPE option<string>;
+DEFINE FIELD anchor        ON references TYPE option<string>;
 DEFINE FIELD snapshot_text ON references TYPE option<string>;
 DEFINE FIELD snapshot_at   ON references TYPE option<datetime>;
 ```
@@ -838,6 +842,8 @@ SELECT * FROM thing WHERE postponed_count > 2
       - платформа: текст           # для мессенджеров: Telegram / WhatsApp / Signal / ВКонтакте
       - метка: текст               # для контактов: личный / рабочий / домашний
       - предпочтительный: булево   # true = основной способ связи
+      - source_file: текст         # для promoted block: имя .md файла в директории владельца
+      - anchor: текст              # для promoted block: якорь секции в файле (без ^)
       - filename: текст            # для файловых узлов: имя файла на диске ("scan.pdf")
       - mime_type: текст           # для файловых узлов: "image/jpeg", "application/pdf"
       - size: число                # размер файла в байтах
@@ -983,11 +989,13 @@ SELECT * FROM thing WHERE postponed_count > 2
       - label: текст
 
   references:
-    описание: блок ссылается на другой блок с тремя режимами поведения
-    от: thing   # блок-источник (документ, параграф, embed-контейнер)
-    к: thing    # блок-цель (любой thing с text)
+    описание: блок или узел ссылается на другой узел или Markdown-файл
+    от: thing   # блок-источник или любой thing с документом
+    к: thing    # блок-цель, promoted block, или владелец файла
     поля:
       - mode: текст           # live / snapshot / link
+      - source_file: текст    # имя .md файла в директории цели ("protocol.md")
+      - anchor: текст         # якорь секции в файле ("protocol-anchor"), без ^
       - snapshot_text: текст  # для mode=snapshot: замороженный текст цели на момент фиксации
       - snapshot_at: дата     # когда был сделан снапшот
 ```
@@ -1812,13 +1820,52 @@ SELECT DISTINCT
 и полем `order` на ребре для порядка. Блок может включать другой блок тремя способами
 через ребро `references`.
 
+### Философия: Markdown-файлы первичны, `thing`-узлы — исключение
+
+Контент живёт в `.md` файлах на диске. UUID не назначаются каждому абзацу автоматически.
+Блок становится `thing`-узлом только тогда, когда человек или AI решили, что он нужен в графе —
+например, его нужно транскузировать в другой документ, назначить на него задачу, или дать доступ.
+
+```
+~/.domovoy/files/
+├── experiment_crystals/
+│   ├── protocol.md        ← просто текст, никаких UUID на абзацы
+│   └── observations.md
+└── article_crystallization/
+    └── draft.md
+```
+
+**Promoted block** — секция файла, получившая якорь и `thing`-узел:
+
+```markdown
+## Протокол кристаллизации
+^protocol-anchor
+
+Растворить 50г соли в 200мл воды при t=80°C...
+Охладить до комнатной температуры в течение 24 часов.
+```
+
+```
+thing:block_protocol
+  type: block
+  source_file: "protocol.md"     ← файл внутри директории experiment_crystals
+  anchor: "protocol-anchor"      ← якорь в файле (без ^)
+  text: "Растворить 50г..."      ← кешированная копия для быстрых запросов
+  → part_of → thing:experiment_crystals
+```
+
+Редактирование — в файле. При сохранении приложение обновляет кеш `text` в узле.
+AI предлагает промоут: *"Это определение встречается в 4 документах — добавить якорь?"*
+
 ### Три режима включения
 
-| Режим | Поведение при рендере | Что хранится |
-|-------|----------------------|--------------|
-| `live` | Показать актуальный `text` цели | Только ребро |
-| `snapshot` | Показать `snapshot_text` с ребра | Ребро + копия текста + дата |
-| `link` | Показать кликабельную ссылку | Только ребро |
+| Режим | Что включается | Что хранится на ребре |
+|-------|---------------|----------------------|
+| `live` файл | Весь `.md` файл, читается с диска | `source_file` |
+| `live` секция | Секция файла по якорю | `source_file` + `anchor` |
+| `live` узел | `text` поле `thing`-узла (promoted block) | только ребро к узлу |
+| `snapshot` | Заморожено в `snapshot_text` | `snapshot_text` + `snapshot_at` |
+| `link` | Кликабельная ссылка, навигация | только ребро |
 
 ### Структура документа
 
