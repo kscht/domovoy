@@ -843,6 +843,7 @@ SELECT * FROM thing WHERE postponed_count > 2
       - платформа: текст           # для мессенджеров: Telegram / WhatsApp / Signal / ВКонтакте
       - метка: текст               # для контактов: личный / рабочий / домашний
       - предпочтительный: булево   # true = основной способ связи
+      - identified: булево         # false = stub-узел, ещё не идентифицирован (ожидает фото и AI)
       - code_type: текст           # тип кода: ean13 / ean8 / qr / datamatrix / честный_знак / serial / imei / vin / isbn / rfid / custom_qr / ozon / wb / артикул
       - code_value: текст          # значение кода: "4607082660271", "X1Y2Z3..."
       - code_system: текст         # кто выдал: производитель / ozon / wb / wildberries / честный_знак / домовой
@@ -2295,6 +2296,71 @@ SELECT * FROM thing WHERE status != "выполнено"
 
 ---
 
+### 8. QR-наклейка → фото → AI-идентификация
+
+Наклеил QR на незнакомый компонент — приложение создаёт stub-узел. Фотографируешь —
+AI заполняет имя, описание, находит производственные коды если они попали в кадр.
+
+**Три стадии одного узла:**
+
+```mermaid
+graph LR
+    S1[Стадия 1: stub\nname: null\nidentified: false\n→ identified_by → custom_qr]
+    S2[Стадия 2: фото загружены\n5 фото → about → узел\nstatus: в процессе]
+    S3[Стадия 3: идентифицирован\nname: STM32F103C8T6\ndescription: ...\nidentified: true]
+
+    S1 -->|загрузил фото| S2
+    S2 -->|AI обработал| S3
+```
+
+**Пайплайн:**
+
+```
+thing:stm32_stub
+  name: null
+  identified: false
+  → identified_by, printed_at: 18 мая → thing:code_qr_001
+
+Photos 1-6:
+  type: photo, filename: "stm32_1.jpg" ... "stm32_6.jpg"
+  → about → thing:stm32_stub           ← в vault stm32_stub/
+
+thing:task_identify
+  → depends_on → photos
+  → assigned_to → thing:ai_vision
+  → about → thing:stm32_stub
+  → produces → identification
+
+После обработки thing:stm32_stub:
+  name: "STM32F103C8T6 Blue Pill"
+  description: "ARM Cortex-M3, 72MHz, 64KB Flash, 20KB SRAM"
+  quantity: 3
+  unit: шт
+  identified: true
+  → identified_by → thing:code_ean_stm32   ← AI заметил на фото
+```
+
+AI видит все фото одновременно — определяет тип компонента, количество штук,
+замечает маркировку производителя если она попала в кадр и добавляет её как
+ещё один `identified_by` автоматически.
+
+```surql
+-- Все неидентифицированные вещи (нужно сфотографировать)
+SELECT * FROM thing WHERE identified = false;
+
+-- Stub-узлы без фото (наклейка есть, фото ещё нет)
+SELECT * FROM thing WHERE identified = false
+  AND (SELECT * FROM thing WHERE ->about->thing = $parent.id
+    AND type = "photo") IS EMPTY;
+
+-- Что AI нашёл при идентификации (все produced из задач идентификации)
+SELECT ->produces->thing.* FROM thing
+  WHERE ->assigned_to->thing = thing:ai_vision
+  AND ->about->thing = thing:stm32_stub;
+```
+
+---
+
 ## Сценарий: маркировка физических вещей
 
 Каждый код — отдельный `thing`-узел с `code_type`, `code_value`, `code_system`.
@@ -2369,22 +2435,28 @@ Custom QR кодирует ID узла напрямую: `domovoy://thing/{id}`.
 `printed_at` на ребре `identified_by` фиксирует дату печати наклейки. По этому полю
 можно найти все вещи у которых наклейка уже есть, и те которые ещё нужно промаркировать.
 
-### Честный знак и лекарства
+### DataMatrix и Честный знак дома
+
+Дома верификация подлинности не нужна — достаточно уникального кода конкретной единицы
+из DataMatrix для поштучного учёта. `url` не заполняется:
 
 ```
-thing:code_chestnyznak_medicine
-  code_type: честный_знак
-  code_value: "010460..."
+thing:code_dm_amoxicillin_unit1
+  code_type: datamatrix
+  code_value: "010460082100018921VmrTPVX92306"   ← уникален для каждой пачки
   code_system: честный_знак
-  url: "https://честныйзнак.рф/..."    ← ссылка на верификацию
-
-thing:medicine_amoxicillin
-  → identified_by → thing:code_chestnyznak_medicine
-  → identified_by → thing:code_ean_medicine
+  url: null   ← верификация опциональна, дома не нужна
 ```
 
-Поле `url` на коде — ссылка на страницу верификации. Из приложения — один клик
-для проверки подлинности.
+Два пакета одного лекарства → два кода с разными `code_value`. Поштучный учёт:
+списал одну пачку — удалил её код. Сколько кодов `datamatrix` у `thing:amoxicillin` — столько единиц в наличии.
+
+```
+thing:medicine_amoxicillin
+  → identified_by → thing:code_dm_unit1   (пачка 1)
+  → identified_by → thing:code_dm_unit2   (пачка 2)
+  → identified_by → thing:code_ean_amox   (общий EAN на упаковке)
+```
 
 ```surql
 -- Найти вещь по любому коду (сканирование)
