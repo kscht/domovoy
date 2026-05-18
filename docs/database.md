@@ -5618,6 +5618,214 @@ WHERE kind = "контент-идея"
 ORDER BY created_at ASC;
 ```
 
+## Сценарий: граф как контент Telegram-канала
+
+Граф — источник истины. Telegram-канал — живая проекция поддерева.
+Редактируешь узел → сообщение в канале обновляется. Добавляешь дочерний узел → новое сообщение в треде.
+
+### Канал и сообщение как узлы
+
+```
+thing:tg_channel_cooking
+  kind: telegram-канал
+  chat_id: "-1001234567890"
+  name: "Кулинарный блог Марины"
+  topics_enabled: true         ← Telegram supergroup с топиками (форум-режим)
+  → can_access ← thing:gateway_telegram
+
+thing:tg_msg_borsch_main
+  kind: telegram-сообщение
+  message_id: 142              ← ID сообщения в Telegram (нужен для edit/delete)
+  thread_id: 98                ← ID топика (если topics_enabled)
+  reply_to_message_id: null    ← null = корневое сообщение в треде
+  sent_at: 2026-05-19T10:00:00Z
+  edited_at: 2026-05-19T12:30:00Z
+  → part_of → thing:tg_channel_cooking
+  → about   → thing:recipe_borsch     ← исходный узел графа
+```
+
+### Дерево графа → дерево тредов
+
+Иерархия `part_of` в графе отображается в цепочку ответов в Telegram:
+
+```mermaid
+graph TD
+    subgraph Граф
+        R[Рецепт: Борщ классический]
+        I[Ингредиенты\npart_of Рецепт, order 1]
+        S[Шаги приготовления\npart_of Рецепт, order 2]
+        T[Советы и вариации\npart_of Рецепт, order 3]
+        S1[Шаг 1: нарезать свёклу\npart_of Шаги, order 1]
+        S2[Шаг 2: пассеровать\npart_of Шаги, order 2]
+    end
+
+    subgraph Telegram-тред
+        M1[Сообщение: Борщ классический\nmessage_id: 142]
+        M2[Ответ: Ингредиенты\nmessage_id: 143\nreply_to: 142]
+        M3[Ответ: Шаги\nmessage_id: 144\nreply_to: 142]
+        M4[Ответ: Советы\nmessage_id: 145\nreply_to: 142]
+        M5[Ответ: Шаг 1\nmessage_id: 146\nreply_to: 144]
+        M6[Ответ: Шаг 2\nmessage_id: 147\nreply_to: 144]
+    end
+
+    R --> M1
+    I --> M2
+    S --> M3
+    T --> M4
+    S1 --> M5
+    S2 --> M6
+```
+
+Каждый узел графа `produces` своё сообщение:
+
+```
+thing:recipe_borsch      → produces → thing:tg_msg_142
+thing:section_ingr       → produces → thing:tg_msg_143
+thing:section_steps      → produces → thing:tg_msg_144
+thing:section_tips       → produces → thing:tg_msg_145
+thing:step_1_beet        → produces → thing:tg_msg_146
+```
+
+### Шаблон рендера
+
+Каждый `kind` узла рендерится по своему шаблону:
+
+```
+thing:tmpl_recipe_tg
+  kind: шаблон-публикации
+  platform: telegram
+  applies_to_kind: рецепт
+  template: |
+    {{emoji}} **{{name}}**
+    {{#if description}}
+    {{description}}
+    {{/if}}
+    ⏱ {{cook_time}} мин  |  👥 {{servings}} порций
+    {{#each tags}}#{{this}} {{/each}}
+
+thing:tmpl_ingredients_tg
+  kind: шаблон-публикации
+  applies_to_kind: раздел-ингредиентов
+  template: |
+    **Ингредиенты:**
+    {{#each items}}• {{quantity}} {{unit}} — {{name}}
+    {{/each}}
+
+thing:tmpl_step_tg
+  kind: шаблон-публикации
+  applies_to_kind: шаг-рецепта
+  template: "{{order}}. {{text}}"
+```
+
+Шаблон — тот же модуль с `inputs`-запросом (уже в модели):
+
+```
+inputs:
+  рецепт:
+    query: "SELECT name, description, cook_time, servings FROM thing WHERE id = $node_id"
+    format: table
+  теги:
+    query: "SELECT name FROM thing WHERE <-related_to<-thing = $node_id"
+    format: table
+```
+
+### Синхронизация: граф изменился → Telegram обновился
+
+```surql
+DEFINE EVENT sync_node_to_telegram ON TABLE thing
+  WHEN $event = "UPDATE"
+    AND count(->produces->thing[WHERE kind = "telegram-сообщение"]) > 0
+  THEN {
+    LET $msgs = SELECT * FROM ->produces->thing WHERE kind = "telegram-сообщение";
+    FOR $msg IN $msgs {
+      CREATE thing SET
+        kind       = "задание",
+        operation  = "edit_message",
+        node_id    = $value.id,
+        message_id = $msg.message_id,
+        chat_id    = $msg.chat_id,
+        created_at = time::now()
+      ;
+      RELATE $last->part_of->thing:queue_tg_sync;
+    };
+  };
+```
+
+Воркер берёт задание → рендерит узел по шаблону → вызывает `editMessageText` через gateway → обновляет `tg_msg.edited_at`.
+
+### Таблица: действие в графе → действие в Telegram
+
+| Действие в графе | Telegram Bot API |
+|------------------|-----------------|
+| Изменить текст/поля узла | `editMessageText` |
+| Добавить дочерний узел | `sendMessage` с `reply_to_message_id` родителя |
+| Удалить узел | `deleteMessage` + убрать `produces` |
+| Переместить (новый `part_of`) | `deleteMessage` + `sendMessage` в новом треде |
+| Изменить `order` | нельзя переупорядочить в TG — `pin` важного |
+| Добавить изображение | `editMessageMedia` или новый `sendPhoto` |
+| Опубликовать новое поддерево | рекурсивный обход `part_of`, `sendMessage` в порядке `order` |
+
+### Пример: кулинарный канал с топиками
+
+```
+thing:tg_channel_cooking            ← канал с topics_enabled
+
+├── topic: Супы  (thread_id: 10)
+│     ├── thing:tg_msg_borsch        ← about → thing:recipe_borsch
+│     │     ├── thing:tg_msg_ingr    ← about → thing:section_ingredients
+│     │     └── thing:tg_msg_steps   ← about → thing:section_steps
+│     └── thing:tg_msg_solyanka      ← about → thing:recipe_solyanka
+│
+├── topic: Выпечка  (thread_id: 20)
+│     └── thing:tg_msg_bread         ← about → thing:recipe_bread
+│
+└── topic: Советы  (thread_id: 30)
+      └── thing:tg_msg_tip_salt      ← about → thing:tip_salt_properly
+```
+
+Топик = `kind: telegram-топик` с `thread_id`, `part_of` канала:
+
+```
+thing:topic_soups
+  kind: telegram-топик
+  thread_id: 10
+  name: "Супы"
+  → part_of → thing:tg_channel_cooking
+  → about   → thing:category_soups    ← категория в графе рецептов
+```
+
+### Публикация нового поддерева
+
+Рекурсивный обход дерева по `part_of` → отправить сообщения в порядке `order`,
+каждый следующий уровень — `reply_to_message_id` родителя:
+
+```surql
+-- Все узлы поддерева рецепта в порядке обхода
+SELECT id, name, kind,
+       ->part_of.order AS порядок,
+       count(<-part_of<-thing) AS дочерних
+FROM thing
+WHERE id INSIDE (
+  SELECT id FROM thing WHERE id = thing:recipe_borsch
+  UNION
+  SELECT id FROM thing WHERE ->part_of->thing = thing:recipe_borsch DEPTH 5
+)
+ORDER BY порядок ASC;
+
+-- Узлы графа без Telegram-сообщения (ещё не опубликованы)
+SELECT name, kind FROM thing
+WHERE ->part_of->thing = thing:recipe_borsch
+  AND count(->produces->thing[WHERE kind = "telegram-сообщение"]) = 0;
+
+-- Все сообщения канала и когда последний раз обновлялись
+SELECT ->about->thing.name AS узел, message_id, sent_at, edited_at,
+       (edited_at - sent_at) AS задержка_правки
+FROM thing
+WHERE kind = "telegram-сообщение"
+  AND ->part_of->thing = thing:tg_channel_cooking
+ORDER BY sent_at DESC;
+```
+
 ---
 
 ## Открытые вопросы
