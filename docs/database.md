@@ -7952,6 +7952,228 @@ ORDER BY order ASC;
 
 ---
 
+## Масштабируемость: внешние воркеры и app-серверы
+
+Схема изначально рассчитана на горизонтальное масштабирование. Всё состояние — в SurrealDB. Воркеры и app-серверы stateless: читают job, исполняют, пишут результат. Число подов меняется без изменений схемы.
+
+### Архитектура
+
+```
+SurrealDB  (единый source of truth, stateful)
+    ↑↓ LIVE SELECT / HTTP API / WebSocket
+┌──────────────────────────────────────────────┐
+│  Stateless слой (горизонтально масштабируем) │
+│                                              │
+│  Next.js API      ×N   UI + REST API         │
+│  Оркестратор      ×M   запуски плейбуков     │
+│  Worker-HTTP      ×K   HTTP-модули           │
+│  Worker-AI        ×L   AI-шаги              │
+│  Worker-Python    ×P   код-модули            │
+│  Worker-Шлюз      ×Q   gateway-интеграции   │
+└──────────────────────────────────────────────┘
+   Kubernetes / bare-metal / serverless functions
+```
+
+Каждый тип воркера — отдельный Deployment в Kubernetes. Масштабируется независимо по нагрузке.
+
+### Конкурентный захват задачи
+
+Несколько подов конкурируют за jobs через атомарный UPDATE. Классический competing consumers — без внешней очереди (Redis, RabbitMQ): SurrealDB сам является очередью.
+
+```surql
+-- Атомарный захват задачи (optimistic locking)
+-- 0 затронутых строк = другой под успел первым, берём следующую
+UPDATE thing SET
+  status         = "запущен",
+  locked_by      = $worker_instance_id,
+  locked_at      = time::now(),
+  lock_expires_at = time::now() + 5m
+WHERE id = $job_id
+  AND status   = "ожидание"
+  AND locked_by = NONE;
+```
+
+### LIVE SELECT вместо поллинга
+
+SurrealDB поддерживает push-уведомления нативно. Воркер подписывается один раз — и получает события при появлении новых задач без поллинга.
+
+```surql
+-- Воркер подписывается на свои очереди
+LIVE SELECT id, kind, context FROM thing
+WHERE kind = "запуск-плейбука"
+  AND status = "ожидание"
+  AND ->part_of->thing->triggered_by->thing IN $my_queues;
+```
+
+Новый `kind: запуск-плейбука` создан → все подписанные воркеры получают событие → первый атомарно захватывает через UPDATE выше → остальные получают 0 строк и ждут следующего.
+
+### kind: воркер-инстанс
+
+Регистрация живых подов в графе — для observability, мониторинга и управления мёртвыми локами.
+
+```yaml
+kind: воркер-инстанс
+pod_name:       "domovoy-worker-ai-7f8d9c-xkp2q"
+node:           "k8s-node-3"
+namespace:      "domovoy-prod"
+capabilities:   ["ai", "surreal"]          # типы задач, которые умеет
+started_at:     datetime
+last_heartbeat: datetime                   # обновляется каждые 10 сек
+status:         "активен" | "завершает" | "мёртв"
+current_job:    record<thing>              # текущий запуск-плейбука или NONE
+jobs_completed: int
+jobs_failed:    int
+part_of: thing:worker_ai_def              # ← определение воркера
+```
+
+```surql
+DEFINE TABLE воркер-инстанс SCHEMALESS;
+DEFINE INDEX idx_heartbeat ON thing FIELDS kind, status, last_heartbeat;
+```
+
+**Heartbeat от пода** (каждые 10 секунд):
+```surql
+UPDATE thing:worker_inst_xyz SET last_heartbeat = time::now()
+WHERE kind = "воркер-инстанс";
+```
+
+**Оркестратор находит мёртвые поды и снимает их локи:**
+```surql
+-- Поды без heartbeat > 30 сек считаются мёртвыми
+LET $dead = SELECT id FROM thing
+  WHERE kind = "воркер-инстанс"
+    AND last_heartbeat < time::now() - 30s
+    AND status = "активен";
+
+UPDATE $dead SET status = "мёртв";
+
+-- Освободить задачи, захваченные мёртвыми подами
+UPDATE thing SET
+  status    = "ожидание",
+  locked_by = NONE,
+  lock_expires_at = NONE
+WHERE kind IN ["запуск-плейбука", "запуск-воркера"]
+  AND status = "запущен"
+  AND locked_by IN $dead.id;
+```
+
+### Приоритеты и шардирование очередей
+
+Разные типы воркеров подписываются на разные очереди. Воркер объявляет `capabilities` при старте — оркестратор направляет задачу в подходящую очередь.
+
+```
+kind: очередь  (name: "ai-tasks",    max_concurrent: 5)  ← только Worker-AI
+kind: очередь  (name: "http-tasks",  max_concurrent: 20) ← Worker-HTTP
+kind: очередь  (name: "python-tasks",max_concurrent: 10) ← Worker-Python
+kind: очередь  (name: "priority",    max_concurrent: 3)  ← быстрая очередь
+```
+
+```surql
+-- Взять следующую задачу с учётом приоритета
+SELECT id FROM thing
+WHERE kind = "запуск-плейбука"
+  AND status = "ожидание"
+  AND ->part_of->thing->triggered_by->thing IN $my_queues
+ORDER BY priority DESC, created_at ASC
+LIMIT 1;
+```
+
+### Деплой в Kubernetes
+
+```yaml
+# Пример: Deployment для AI-воркеров
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: domovoy-worker-ai
+spec:
+  replicas: 3                    # начальное число подов
+  selector:
+    matchLabels:
+      app: domovoy-worker-ai
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: domovoy/worker-ai:latest
+          env:
+            - name: SURREALDB_URL
+              value: "ws://surrealdb:8000/rpc"
+            - name: WORKER_CAPABILITIES
+              value: "ai,surreal"
+            - name: WORKER_QUEUES
+              value: "ai-tasks,priority"
+---
+# HorizontalPodAutoscaler по глубине очереди
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  scaleTargetRef:
+    name: domovoy-worker-ai
+  minReplicas: 1
+  maxReplicas: 20
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: domovoy_queue_depth   # метрика из Prometheus
+        target:
+          averageValue: "5"           # 5 задач на под
+```
+
+### Мультирегиональность
+
+Наша федерация + HLC уже описаны. Воркеры в разных регионах подключаются к ближайшему инстансу SurrealDB. Jobs реплицируются через change_log при необходимости.
+
+```
+Регион EU: SurrealDB-EU ←→ SurrealDB-RU :Регион RU
+              ↑                    ↑
+         Workers-EU           Workers-RU
+```
+
+### SurrealQL: observability
+
+```surql
+-- Живые воркер-инстансы прямо сейчас
+SELECT pod_name, node, capabilities, last_heartbeat,
+       current_job.name AS выполняет,
+       jobs_completed, jobs_failed,
+       time::duration(time::now() - started_at) AS uptime
+FROM thing
+WHERE kind = "воркер-инстанс" AND status = "активен"
+ORDER BY last_heartbeat DESC;
+
+-- Глубина очередей
+SELECT ->triggered_by->thing.name AS очередь,
+       count() AS ожидает
+FROM thing
+WHERE kind = "запуск-плейбука" AND status = "ожидание"
+GROUP BY очередь
+ORDER BY ожидает DESC;
+
+-- Throughput воркеров за последний час
+SELECT ->part_of->thing.name AS воркер,
+       count() AS завершено,
+       math::mean(
+         time::duration(finished_at - started_at)
+       ) AS среднее_время
+FROM thing
+WHERE kind = "запуск-плейбука"
+  AND status = "завершён"
+  AND finished_at > time::now() - 1h
+GROUP BY воркер;
+
+-- Мёртвые поды и их незавершённые задачи
+SELECT pod_name, last_heartbeat,
+       count(<-locked_by<-thing[WHERE status = "запущен"]) AS брошенных_задач
+FROM thing
+WHERE kind = "воркер-инстанс"
+  AND last_heartbeat < time::now() - 30s
+  AND status != "мёртв";
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
