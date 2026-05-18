@@ -7440,6 +7440,256 @@ WHERE kind = "вид" AND for_kind = $target_kind;
 
 ---
 
+## Голосовые помощники и чат-боты
+
+Чат-бот — это `kind: агент-ai`, подключённый к `kind: шлюз`. Голосовой помощник — тот же агент, другой шлюз с STT/TTS модулями. Лог разговора — `kind: чат` (уже спроектирован). Новых kinds не нужно.
+
+### Архитектура
+
+```
+Пользователь
+  ↓ голос / текст
+kind: шлюз  (telegram-bot | web-chat | voice-local | алиса)
+  ↓ нормализованный текст + метаданные автора
+kind: агент-ai  (мозг бота)
+  ↓ читает контекст через inputs
+  ↓ вызывает граф-операции через tool use
+  ↓ генерирует ответ
+kind: шлюз  (отправляет ответ обратно)
+  ↓ текст / голос
+Пользователь
+```
+
+Весь разговор пишется в `kind: чат` → `kind: сообщение`.
+
+### Новые subtypes шлюза
+
+| subtype | платформа |
+|---------|-----------|
+| `telegram-bot` | Telegram Bot API |
+| `web-chat` | встроенный виджет на сайте/PWA |
+| `voice-local` | локальный голосовой ассистент (Home Assistant, custom) |
+| `алиса` | Яндекс Алиса (навык) |
+| `home-assistant` | Home Assistant conversation agent |
+| `whatsapp-bot` | WhatsApp Business API |
+
+### Tool use: граф как инструменты LLM
+
+Агент не генерирует сырой SurrealQL — вызывает структурированные граф-операции через LLM tool use / function calling. Бэкенд транслирует в SurrealQL с проверкой прав `can_access` текущего пользователя.
+
+```json
+// Создать задачу
+{ "tool": "create",
+  "kind": "задача",
+  "fields": { "name": "Купить молоко", "status": "активна", "due_date": "2025-05-20" },
+  "edges": [{ "type": "part_of", "to": "thing:list_shopping" },
+             { "type": "assigned_to", "to": "thing:user_me" }] }
+
+// Найти по смыслу
+{ "tool": "search",
+  "query": "задачи на сегодня",
+  "limit": 10 }
+
+// Обновить узел
+{ "tool": "update",
+  "id": "thing:task_milk",
+  "fields": { "status": "выполнена" } }
+
+// Создать ребро
+{ "tool": "relate",
+  "from": "thing:task_abc",
+  "edge": "assigned_to",
+  "to": "thing:user_wife" }
+
+// Выполнить сохранённый умный список
+{ "tool": "run_list",
+  "id": "thing:list_today" }
+```
+
+Агент никогда не видит сырую схему БД — только предоставленные инструменты. Все операции проходят через слой прав доступа.
+
+### Конфигурация агента-бота
+
+```yaml
+kind: агент-ai
+name: "Домовой Ассистент"
+model: "claude-haiku-4-5"      # быстрый и дешёвый для бытовых запросов
+provider: thing:ds_anthropic
+system_prompt: thing:prompt_домовой_bot
+tools:
+  - create
+  - update
+  - search
+  - relate
+  - run_list
+max_tool_calls: 5              # защита от зацикливания
+inputs:
+  user_tasks:
+    source: surreal
+    query: >
+      SELECT name, status, due_date FROM thing
+      WHERE kind = 'задача' AND ->assigned_to->thing = $auth
+        AND status != 'выполнена'
+      ORDER BY due_date ASC LIMIT 10
+    format: text
+  shopping_list:
+    source: surreal
+    query: >
+      SELECT name, quantity FROM thing
+      WHERE kind = 'товар' AND status = 'нужен'
+    format: text
+  recent_context:
+    source: surreal
+    query: >
+      SELECT name, kind, updated_at FROM thing
+      WHERE updated_at > time::now() - 1h
+      ORDER BY updated_at DESC LIMIT 5
+    format: text
+triggered_by: thing:gateway_telegram_bot
+produces: thing:chat_bot_log    # лог разговора
+```
+
+### Голосовой помощник
+
+Отличие от чат-бота — только входной и выходной канал. Мозг (`kind: агент-ai`) одинаков.
+
+```
+kind: шлюз  (subtype: voice-local)
+  stt_provider: thing:ds_whisper      ← speech-to-text
+  tts_provider: thing:ds_yandex_tts  ← text-to-speech
+  wake_word: "Домовой"
+  device: thing:device_kitchen_speaker
+```
+
+STT и TTS — `kind: источник-данных`:
+
+| subtype | сервис |
+|---------|--------|
+| `whisper-local` | OpenAI Whisper локально |
+| `whisper-api` | OpenAI Whisper API |
+| `google-stt` | Google Speech-to-Text |
+| `yandex-stt` | Яндекс SpeechKit STT |
+| `yandex-tts` | Яндекс SpeechKit TTS |
+| `edge-tts` | Microsoft Edge TTS (бесплатный) |
+| `piper` | Piper TTS локально |
+
+Голосовой запрос сохраняется в `kind: сообщение` как текст (транскрипт) с вложением аудио:
+
+```yaml
+kind: сообщение
+role: "user"
+content: "Добавь молоко в список покупок"    ← транскрипт от STT
+model_transcript_confidence: 0.97
+attachments:
+  - type: audio
+    vault_id: "file:voice_2025-05-19_kitchen"
+    duration_sec: 3.2
+part_of: thing:chat_bot_log
+```
+
+### Контекст: устройство → пользователь
+
+Голосовой запрос приходит с устройства. Устройство привязано к пользователю — так определяется `$auth` без явной аутентификации:
+
+```
+kind: устройство
+  name: "Колонка на кухне"
+  owned_by → kind: пользователь  (Папа)
+
+kind: устройство
+  name: "Планшет в детской"
+  owned_by → kind: пользователь  (Сын)
+```
+
+Если устройство шарится (семейный планшет) — бот уточняет: «Кто говорит?» или распознаёт по голосовому профилю.
+
+### Потоки данных
+
+```mermaid
+graph TD
+    Voice["Голос пользователя"]
+    TG["Telegram сообщение"]
+    GW_V["kind: шлюз\nsubtype: voice-local"]
+    GW_T["kind: шлюз\nsubtype: telegram-bot"]
+    STT["kind: источник-данных\nsubtype: whisper-local"]
+    Agent["kind: агент-ai\nДомовой Ассистент"]
+    Graph[("SurrealDB\nграф")]
+    Chat["kind: чат\nЛог разговора"]
+    TTS["kind: источник-данных\nsubtype: edge-tts"]
+    Out_V["Голосовой ответ"]
+    Out_T["Telegram ответ"]
+
+    Voice --> GW_V
+    GW_V -->|audio| STT
+    STT -->|transcript| Agent
+    TG --> GW_T
+    GW_T -->|text| Agent
+    Agent -->|tool use| Graph
+    Graph -->|результат| Agent
+    Agent -->|лог| Chat
+    Agent -->|response text| GW_V
+    Agent -->|response text| GW_T
+    GW_V --> TTS
+    TTS --> Out_V
+    GW_T --> Out_T
+```
+
+### Промпт бота
+
+```yaml
+kind: промпт
+name: "Домовой Ассистент — системный промпт"
+text: |
+  Ты голосовой ассистент для семейной системы Домовой.
+  Отвечай кратко — ответ будет прочитан вслух.
+  Используй инструменты для чтения и изменения данных.
+  Перед изменением данных — уточни если не уверен.
+  Обращайся к пользователю по имени из контекста.
+  Текущий пользователь: {{user_name}}.
+  Задачи на сегодня: {{user_tasks}}.
+  Список покупок: {{shopping_list}}.
+part_of: thing:collection_bot_prompts
+```
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Последние разговоры с ботом
+SELECT name, created_at,
+       count(<-part_of<-thing[WHERE kind = "сообщение"]) AS реплик,
+       ->about->thing.name AS контекст
+FROM thing
+WHERE kind = "чат"
+  AND ->triggered_by->thing.kind = "шлюз"
+ORDER BY created_at DESC LIMIT 20;
+
+-- Что бот делал: все граф-операции за сегодня
+SELECT content, role, created_at,
+       ->part_of->thing.name AS чат
+FROM thing
+WHERE kind = "сообщение"
+  AND role = "tool"
+  AND created_at > time::now() - 1d
+ORDER BY created_at DESC;
+
+-- Самые частые запросы к боту (по intent из content)
+SELECT content, count() AS раз
+FROM thing
+WHERE kind = "сообщение" AND role = "user"
+  AND ->part_of->thing->triggered_by->thing.kind = "шлюз"
+GROUP BY content
+ORDER BY раз DESC LIMIT 20;
+
+-- Устройства и их пользователи
+SELECT name, ->owned_by->thing.name AS владелец,
+       max(<-part_of<-thing[WHERE kind = "сообщение"].created_at) AS последний_запрос
+FROM thing
+WHERE kind = "устройство"
+ORDER BY последний_запрос DESC;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
