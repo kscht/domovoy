@@ -368,6 +368,65 @@ SELECT * FROM thing
 
 ---
 
+## Сценарий: жалоба с fan-out по инстанциям
+
+Одна жалоба охватывает несколько объектов. Вышестоящая инстанция пересылает её вниз —
+каждое подзадело живёт независимо, но остаётся связано с корнем через `part_of`.
+
+```mermaid
+graph TD
+    Root[Жалоба в облпрокуратуру\nstatus: выполнено]
+    RegProc[Областная прокуратура]
+    Notify[Уведомление о пересылке]
+
+    Root -->|filed_with| RegProc
+    Root -->|about| School1[Школа №1]
+    Root -->|about| School2[Школа №2]
+    Root -->|about| School10[Школа №10 ...]
+    Root -->|produces| Notify
+
+    Sub1[Дело: школа №1\nstatus: в процессе]
+    Sub2[Дело: школа №2\nstatus: выполнено]
+    Sub10[Дело: школа №10\nstatus: не начато]
+
+    Sub1 -->|part_of| Root
+    Sub2 -->|part_of| Root
+    Sub10 -->|part_of| Root
+
+    Sub1 -->|filed_with| Proc1[Прокуратура района 1]
+    Sub1 -->|about| School1
+    Sub1 -->|produces| Result1[Результат проверки №1\nнарушения выявлены]
+
+    Sub2 -->|filed_with| Proc2[Прокуратура района 2]
+    Sub2 -->|about| School2
+    Sub2 -->|produces| Result2[Результат проверки №2\nнарушений не выявлено]
+
+    Appeal2[Обжалование по школе №2\nstatus: не начато]
+    Appeal2 -->|about| Result2
+    Appeal2 -->|filed_with| RegProc
+```
+
+**Почему это работает без изменений схемы:**
+- `part_of` связывает подзадела с корневой жалобой — всегда виден источник
+- Каждое подзадело независимо: своя прокуратура (`filed_with`), свой результат (`produces`), своё обжалование (`about`)
+- Fan-out естественен для графа — у одного узла может быть сколько угодно рёбер любого типа
+
+```surql
+-- Все подзадела и их статусы
+SELECT name, status, ->filed_with->thing.name AS прокуратура
+FROM thing WHERE ->part_of->thing = thing:root_complaint;
+
+-- Результаты которые можно обжаловать (есть результат, нет обжалования)
+SELECT * FROM thing WHERE ->part_of->thing = thing:root_complaint
+  AND ->produces->thing != NONE
+  AND NOT (SELECT * FROM thing WHERE ->about->thing = (->produces->thing));
+
+-- Вся цепочка от корневой жалобы вглубь
+SELECT ->part_of<-thing.* FROM thing:root_complaint DEPTH 5;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
