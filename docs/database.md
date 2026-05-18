@@ -6023,6 +6023,302 @@ SELECT ->produces->thing.kind AS тип, ->produces->thing.slug AS slug,
 FROM thing WHERE id = thing:recipe_borsch;
 ```
 
+## Сценарий: протокол работы в консоли
+
+Три слоя: **захват** (команды + вывод) → **анализ AI** (аннотации, изменения) → **документация** (живые доки сервера).
+Работает как для изучения Linux сыном, так и для аудита серверной работы.
+
+### Сессия и команда как узлы
+
+```
+thing:session_20260519_srv1
+  kind: терминал-сессия
+  host: "server1.home"
+  user: "admin"
+  started_at: 2026-05-19T14:00:00Z
+  ended_at:   2026-05-19T15:30:00Z
+  status: активна | завершена | прервана
+  goal: "Настройка nginx для moms-shop.ru"   ← опционально, задаётся при старте
+  via_jump: "bastion.home"                   ← через какой хост зашли
+  raw_recording: "file_id_cast"              ← asciinema/script в vault
+  → about      → thing:server_home1          ← сервер в инвентаре
+  → assigned_to → thing:dad
+
+thing:cmd_042
+  kind: команда
+  text: "apt install nginx"
+  stdout: "Reading package lists... Done\nSetting up nginx (1.24.0)..."
+  stderr: ""
+  exit_code: 0
+  cwd: "/root"
+  executed_at: 2026-05-19T14:07:23Z
+  → part_of → thing:session_20260519_srv1  (order: 42)
+  → produces → thing:annotation_cmd_042    ← AI-аннотация
+```
+
+### Сервер как узел инвентаря
+
+```
+thing:server_home1
+  kind: сервер
+  hostname: "server1.home"
+  ip_local: "192.168.1.10"
+  os: "Ubuntu 24.04 LTS"
+  role: "web"                    ← web | db | bastion | storage | dev
+  cpu: "4 cores"
+  ram_gb: 8
+  → part_of    → thing:homelab
+  → located_at → thing:rack_home
+  → produces   → thing:doc_server_home1    ← живая документация
+```
+
+### Захват данных: три источника
+
+**1. Shell-интеграция** — лёгкий агент в `.bashrc`/`.zshrc`:
+
+```bash
+# При старте сессии — создать узел сессии
+domovoy session start --host "$(hostname)" --user "$(whoami)"
+
+# PROMPT_COMMAND — перехват каждой команды после выполнения
+__domovoy_log() {
+  local exit_code=$?
+  domovoy cmd log \
+    --exit   "$exit_code" \
+    --cwd    "$PWD" \
+    --cmd    "$(history 1 | sed 's/^ *[0-9]* *//')"
+}
+PROMPT_COMMAND="__domovoy_log;$PROMPT_COMMAND"
+
+# При завершении
+trap 'domovoy session end' EXIT
+```
+
+**2. `script` / `asciinema`** — полный PTY-вывод в vault:
+
+```bash
+# Обёртка для записи сессии:
+domovoy record -- ssh admin@server1.home
+# Внутри: script -q -c "ssh ..." | tee $VAULT/session_$(date +%s).cast
+```
+
+**3. Bastion / jump-host** — PTY-лог уже пишется на стороне бастиона:
+
+```
+thing:ds_bastion_logs
+  kind: источник-данных
+  type: file
+  path: "/var/log/bastion/sessions/"
+  format: asciinema               ← или ttyrec, raw text
+  poll_interval: 60
+  → about      → thing:bastion_home
+  → can_access → thing:secret_bastion_ssh
+```
+
+Триггер: новый файл в папке → парсер создаёт `kind: терминал-сессия` + команды.
+
+### AI-анализ сессии
+
+После завершения (или по требованию) — пайплайн разбора:
+
+```
+thing:pipeline_analyze_session
+  kind: пайплайн
+
+thing:step_parse
+  kind: шаг
+  inputs:
+    запись:
+      datasource: thing:ds_vault
+      path: "$session.raw_recording"
+      format: text                   ← raw terminal output
+  → assigned_to → thing:ai_claude
+  → produces    → thing:step_annotate
+
+thing:step_annotate
+  kind: шаг
+  inputs:
+    команды:
+      query: "SELECT text, stdout, stderr, exit_code, cwd
+              FROM thing WHERE ->part_of->thing = $session_id
+              AND kind = 'команда' ORDER BY ->part_of.order"
+      format: table
+    контекст_сервера:
+      query: "SELECT * FROM thing WHERE id = $server_id"
+      format: table
+  → assigned_to → thing:ai_claude
+  → produces    → thing:step_document
+```
+
+### Аннотация команды
+
+AI создаёт `kind: аннотация` для каждой команды:
+
+```
+thing:annotation_cmd_042
+  kind: аннотация
+  explanation: "Устанавливает веб-сервер nginx из официального репозитория Ubuntu"
+  effect: "Добавлен systemd-сервис nginx, автозапуск включён"
+  severity: безопасно           ← безопасно | внимание | опасно | критично
+  better_alternative: null
+  → about → thing:cmd_042
+
+-- Опасная команда:
+thing:annotation_cmd_007
+  kind: аннотация
+  explanation: "Рекурсивное удаление /var/log без подтверждения"
+  severity: опасно
+  better_alternative: "rm -ri /var/log — интерактивный режим с подтверждением"
+  → about → thing:cmd_007
+```
+
+### Изменения состояния сервера
+
+AI выделяет значимые изменения из сессии:
+
+```
+thing:change_nginx_installed
+  kind: изменение-сервера
+  what: "Установлен nginx 1.24.0"
+  why: "Веб-сервер для moms-shop.ru"
+  how: "apt install nginx"
+  reversible: true
+  reverse_cmd: "apt remove nginx"
+  → about   → thing:server_home1
+  → part_of → thing:session_20260519_srv1
+  → produces → thing:doc_block_nginx       ← блок в документации сервера
+
+thing:change_nginx_config
+  kind: изменение-сервера
+  what: "Создан /etc/nginx/sites-available/moms-shop.conf"
+  → about   → thing:server_home1
+  → part_of → thing:session_20260519_srv1
+  → about   → thing:site_moms_shop         ← связь с сайтом в графе
+```
+
+### Живая документация сервера
+
+Формируется автоматически из изменений. Блоки обновляются при каждой сессии:
+
+```
+thing:doc_server_home1
+  kind: документ
+  name: "Документация: server1.home"
+  → about → thing:server_home1
+
+-- Блоки (обновляются AI после каждой сессии):
+thing:block_services   text: "**Сервисы:** nginx 1.24, postgresql 16, docker 25"
+thing:block_ports      text: "**Порты:** 80 (nginx), 443 (nginx), 5432 (pg local)"
+thing:block_sites      text: "**Сайты:** moms-shop.ru → /var/www/moms-shop"
+thing:block_crons      text: "**Cron:** бэкап БД в 03:00, certbot renew в 04:00"
+thing:block_history    text: "**История:** 2026-05-19 установлен nginx..."
+```
+
+### Для сына: обучающий режим
+
+Дополнительный слой поверх аннотаций — прогресс обучения:
+
+```
+thing:learning_profile_son
+  kind: профиль-обучения
+  subject: linux
+  → about → thing:son
+
+-- После анализа сессии:
+thing:mistake_rm_rf
+  kind: ошибка-обучения
+  pattern: "rm -rf без проверки пути"
+  count: 3                          ← сколько раз допустил
+  last_seen: datetime
+  → about      → thing:learning_profile_son
+  → related_to → thing:annotation_cmd_007
+
+thing:skill_package_mgmt
+  kind: навык
+  name: "Управление пакетами apt"
+  confidence: 0.7                   ← 0..1 на основе успешных команд
+  → about → thing:learning_profile_son
+```
+
+```surql
+-- Прогресс сына: частые ошибки
+SELECT pattern, count, last_seen FROM thing
+WHERE kind = "ошибка-обучения"
+  AND ->about->thing = thing:learning_profile_son
+ORDER BY count DESC;
+
+-- Опасные команды за последний месяц
+SELECT text, cwd, executed_at,
+       ->produces->thing.explanation AS пояснение
+FROM thing
+WHERE kind = "команда"
+  AND ->produces->thing.severity IN ["опасно", "критично"]
+  AND executed_at > time::now() - 30d
+ORDER BY executed_at DESC;
+```
+
+### Полная схема потока
+
+```mermaid
+graph TD
+    Shell[Shell / Bastion PTY]
+    Vault[Vault: session.cast]
+    Session[Сессия\nkind: терминал-сессия]
+    Cmds[Команды\nkind: команда]
+    AI[AI-пайплайн\nанализ сессии]
+    Ann[Аннотации\nkind: аннотация]
+    Changes[Изменения\nkind: изменение-сервера]
+    Doc[Документация сервера\nобновляется]
+    Learn[Профиль обучения\nсына]
+
+    Shell -->|script/agent| Vault
+    Shell -->|shell hook| Cmds
+    Cmds -->|part_of| Session
+    Vault -->|represents| Session
+    Session -->|триггер| AI
+    AI -->|produces| Ann
+    AI -->|produces| Changes
+    Changes -->|updates| Doc
+    Ann -->|about| Cmds
+    Ann -->|updates| Learn
+```
+
+### SurrealQL: аудит и статистика
+
+```surql
+-- Все сессии на сервере с итогом
+SELECT host, goal, started_at,
+       time::duration(ended_at - started_at) AS длительность,
+       count(<-part_of<-thing[WHERE kind = "команда"]) AS команд,
+       count(<-part_of<-thing->produces->thing[WHERE severity = "опасно"]) AS опасных
+FROM thing
+WHERE kind = "терминал-сессия" AND ->about->thing = thing:server_home1
+ORDER BY started_at DESC;
+
+-- Что изменилось на сервере за последние 30 дней
+SELECT what, why, ->part_of->thing.started_at AS когда,
+       ->part_of->thing.user AS кто
+FROM thing
+WHERE kind = "изменение-сервера"
+  AND ->about->thing = thing:server_home1
+  AND ->part_of->thing.started_at > time::now() - 30d
+ORDER BY ->part_of->thing.started_at DESC;
+
+-- Команды которые завершились с ошибкой
+SELECT text, stderr, exit_code, cwd, executed_at,
+       ->part_of->thing.host AS хост
+FROM thing
+WHERE kind = "команда" AND exit_code != 0
+ORDER BY executed_at DESC LIMIT 50;
+
+-- Серверы без актуальной документации (давно не было сессий)
+SELECT name, hostname,
+       max(<-about<-thing[WHERE kind = "терминал-сессия"].ended_at) AS последняя_сессия
+FROM thing
+WHERE kind = "сервер"
+ORDER BY последняя_сессия ASC;
+```
+
 ---
 
 ## Открытые вопросы
