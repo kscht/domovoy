@@ -2632,6 +2632,144 @@ SELECT <-contains<-thing[WHERE reason = "ремонт"].*
 FROM thing WHERE kind = "физическое";
 ```
 
+### Перерасход и допсоглашения
+
+Изначальная смета редко совпадает с финалом. Каждое допсоглашение — отдельный `thing part_of` контракта:
+
+```
+thing:change_order_1
+  name: "Допсоглашение №1: грунтовка рамы"
+  amount: 5000
+  status: согласовано
+  → part_of → thing:contract_fence
+  → about   → thing:stage_painting
+```
+
+Итоговый бюджет проекта — сумма основного контракта и всех допсоглашений:
+
+```surql
+-- Актуальный бюджет с учётом перерасходов
+SELECT
+    ->part_of->thing[WHERE name = "Договор: забор"].amount AS смета_базовая,
+    math::sum(amount) AS сумма_допсоглашений,
+    ->part_of->thing[WHERE name = "Договор: забор"].amount
+        + math::sum(amount) AS бюджет_итого
+FROM thing
+WHERE ->part_of->thing = thing:contract_fence
+  AND name ~ "Допсоглашение";
+
+-- Все изменения по контракту: что, почему, сколько
+SELECT name, amount, status, ->about->thing.name AS касается
+FROM thing
+WHERE ->part_of->thing = thing:contract_fence
+  AND name ~ "Допсоглашение"
+ORDER BY created_at ASC;
+```
+
+### История счетов
+
+Каждый счёт — отдельный `thing`. Один `about` контракт или конкретный этап,
+`produces` — задачу на оплату.
+
+```mermaid
+graph TD
+    Contract[Договор: забор]
+    S1[Этап 1: фундамент\nstatus: выполнено]
+    S2[Этап 2: столбы\nstatus: выполнено]
+
+    Inv1[Счёт №1: аванс\namount: 13 500]
+    Inv2[Счёт №2: этап 2\namount: 15 000]
+    Inv3[Счёт №3: итоговый\namount: 21 500]
+
+    Pay1[Оплата аванса]
+    Pay2[Оплата этапа 2]
+    Pay3[Финальная оплата]
+
+    Inv1 -->|about| Contract
+    Inv2 -->|about| S2
+    Inv3 -->|about| Contract
+    Inv1 -->|produces| Pay1
+    Inv2 -->|produces| Pay2
+    Inv3 -->|produces| Pay3
+    S1 -->|part_of| Contract
+    S2 -->|part_of| Contract
+```
+
+```surql
+-- Все счета по контракту и их статус оплаты
+SELECT name, amount,
+       ->about->thing.name AS касается,
+       ->produces->thing.name AS задача_оплаты,
+       ->produces->thing.status AS статус_оплаты
+FROM thing
+WHERE ->about->thing = thing:contract_fence
+  AND name ~ "Счёт"
+ORDER BY created_at ASC;
+
+-- Сколько уже оплачено, сколько осталось
+SELECT
+    math::sum(amount) AS выставлено_всего,
+    math::sum(IF ->produces->thing.status = "выполнено" THEN amount ELSE 0 END) AS оплачено,
+    math::sum(IF ->produces->thing.status != "выполнено" THEN amount ELSE 0 END) AS к_оплате
+FROM thing
+WHERE ->about->thing = thing:contract_fence AND name ~ "Счёт";
+```
+
+### Параллельные этапы
+
+`depends_on` образует направленный ациклический граф (DAG).
+Несколько `depends_on` у одного узла — AND-логика: этап стартует только когда выполнены **все** предшественники.
+
+```mermaid
+graph LR
+    Geo[Геодезия]
+    Found[Фундамент]
+    Mat[Закупка материалов]
+    Posts[Монтаж столбов]
+    Weld[Сварка секций]
+    Paint[Грунтовка / покраска]
+    Final[Финальная сборка]
+
+    Posts -->|depends_on| Found
+    Posts -->|depends_on| Mat
+    Weld -->|depends_on| Posts
+    Paint -->|depends_on| Posts
+    Final -->|depends_on| Weld
+    Final -->|depends_on| Paint
+```
+
+`Фундамент` и `Закупка материалов` выполняются параллельно после `Геодезии`.
+`Монтаж столбов` ждёт обоих. После него параллельно идут `Сварка` и `Покраска`.
+`Финальная сборка` ждёт обоих.
+
+```surql
+-- Создать зависимости параллельных этапов
+RELATE thing:stage_posts->depends_on->thing:stage_foundation;
+RELATE thing:stage_posts->depends_on->thing:stage_materials;
+RELATE thing:stage_final->depends_on->thing:stage_welding;
+RELATE thing:stage_final->depends_on->thing:stage_painting;
+
+-- Этапы, готовые к запуску (все предшественники выполнены)
+SELECT name FROM thing
+WHERE ->part_of->thing = thing:contract_fence
+  AND status = "не начато"
+  AND (
+    -- нет входящих depends_on
+    count(<-depends_on<-thing) = 0
+    OR
+    -- все предшественники выполнены
+    count(<-depends_on<-thing[WHERE status != "выполнено"]) = 0
+  );
+
+-- Критический путь: самая длинная цепочка зависимостей
+SELECT name, deadline,
+       count(->depends_on->thing) AS зависит_от,
+       count(<-depends_on<-thing) AS блокирует
+FROM thing
+WHERE ->part_of->thing = thing:contract_fence
+ORDER BY deadline ASC;
+```
+
 ---
 
 ## Открытые вопросы
