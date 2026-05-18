@@ -2890,6 +2890,134 @@ thing:cell_describe
 
 Поле `status` — тот же набор, что у задач: `не выполнено` / `в процессе` / `выполнено` / `ошибка`.
 
+### Входные данные: единый протокол
+
+Все модули получают данные одинаково — через именованные SurrealQL-запросы в поле `inputs`.
+Рантайм выполняет запросы перед запуском ячейки и передаёт результаты как именованные аргументы.
+Граф — это и есть шина. Никакой отдельной инфраструктуры не нужно.
+
+```
+thing:cell_analysis
+  kind: код
+  language: python
+  inputs:
+    расходы:
+      query:  "SELECT name, amount, date FROM thing WHERE ->part_of->thing = thing:budget_march"
+      format: table
+    категории:
+      query:  "SELECT name FROM thing WHERE kind = 'категория'"
+      format: table
+  source: "analyze(расходы, категории)"
+  → part_of  → thing:doc_analysis  (order: 3)
+  → requires → thing:runtime_python
+  → produces → thing:output_analysis
+```
+
+Поле `format` — подсказка рантайму как сериализовать результат запроса:
+
+| `format` | Что получает модуль | Типичное применение |
+|----------|--------------------|--------------------|
+| `table`  | JSON-массив объектов / датафрейм | Python, R, визуализация |
+| `text`   | Узлы склеены в markdown-текст | Промпт для AI |
+| `graph`  | Узлы + рёбра как вложенный объект | Анализ связей |
+| `scalar` | Первое поле первой строки | Одно значение в шаблон |
+
+Это работает одинаково для всех типов модулей:
+
+| Модуль | `format` | Что делает с данными |
+|--------|----------|----------------------|
+| Python / R | `table` | датафрейм |
+| AI (Claude и др.) | `text` | чанки в системный промпт |
+| Визуализация | `table` | серии графика |
+| SQL-рендер | `table` | HTML-таблица |
+| Экспорт (CSV/PDF) | `table` | строки файла |
+| Уведомление | `text` | тело сообщения |
+| Mermaid / диаграмма | `text` | DSL-код |
+
+### Передача данных между ячейками
+
+Ячейка B читает вывод ячейки A через обычный запрос — вывод уже узел в графе.
+`depends_on` гарантирует порядок выполнения:
+
+```
+thing:cell_load
+  inputs:
+    сырые_данные:
+      query:  "SELECT * FROM thing WHERE ->about->thing = thing:budget_march"
+      format: table
+  → produces → thing:output_clean_data    ← результат попадает в граф
+
+thing:cell_chart
+  inputs:
+    данные:
+      query:  "SELECT * FROM thing:output_clean_data"
+      format: table
+  → depends_on → thing:cell_load          ← ждёт выполнения
+  → produces   → thing:output_chart
+```
+
+### Контекст для AI-модулей
+
+AI-ячейка — частный случай общего протокола. Запросы формируют контекст (RAG),
+граф даёт семантически богатый retrieval без отдельного векторного хранилища:
+
+```
+thing:cell_ai_advisor
+  kind: код
+  language: ai
+  inputs:
+    контекст:
+      query: |
+        SELECT name, description, notes,
+               ->about->thing.name AS объект,
+               ->assigned_to->thing.name AS кому
+        FROM thing
+        WHERE ->part_of->thing = thing:topic_health
+           OR ->about->thing->part_of->thing = thing:topic_health
+        ORDER BY created_at DESC LIMIT 20
+      format: text        ← склеить узлы в markdown-чанки
+    вопрос:
+      query:  "SELECT text FROM thing WHERE id = $user_input_id"
+      format: scalar
+  → requires → thing:ai_claude
+  → produces → thing:output_response
+```
+
+Три стратегии нарезки чанков (`format: text`):
+
+| Стратегия | Что в чанке |
+|-----------|-------------|
+| `по-блокам` | один текстовый блок — минимальная единица |
+| `по-узлам` | name + description + ключевые поля одного `thing` |
+| `по-подграфу` | узел + его соседи (1–2 перехода по рёбрам) |
+
+Граф позволяет точно задать область знаний запросом — не "похожие чанки по вектору",
+а "все узлы в теме Здоровье с глубиной 2":
+
+```surql
+SELECT name, description, notes,
+       ->assigned_to->thing.name AS исполнитель,
+       ->about->thing.name AS объект,
+       ->filed_with->thing.name AS инстанция
+FROM thing
+WHERE ->part_of->thing = thing:topic_health DEPTH 2
+ORDER BY created_at DESC;
+```
+
+### Реактивные ячейки через LIVE SELECT
+
+SurrealDB поддерживает push-уведомления при изменении данных. Ячейка может подписаться
+на часть графа и перевыполниться автоматически — без ручного триггера:
+
+```surql
+LIVE SELECT * FROM thing
+WHERE ->part_of->thing = thing:budget_march;
+```
+
+Когда добавляется новый расход — ячейка графика получает событие и перерисовывает вывод.
+Это мощнее Jupyter (ручной запуск) и Observable (реактивность только внутри браузера):
+данные живут в графе, реакция — на стороне сервера.
+
 ### Типы вывода
 
 | `output_type` | Хранение |
