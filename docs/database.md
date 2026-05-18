@@ -121,10 +121,12 @@ SELECT * FROM thing WHERE status = "в процессе" AND template != true;
 | `represents` | Цифровая копия → физический оригинал | — |
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
+| `references` | Блок ссылается на другой блок с режимом включения | `mode`, `snapshot_text`, `snapshot_at` |
 
 **`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
 **`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
-**`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`
+**`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`  
+**`mode` на ребре `references`:** `live` — живая трансклюзия / `snapshot` — заморожено / `link` — ссылка для навигации
 
 ---
 
@@ -746,6 +748,11 @@ DEFINE TABLE can_access TYPE RELATION FROM thing TO thing;
 
 DEFINE TABLE related_to TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD label ON related_to TYPE string;
+
+DEFINE TABLE references TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD mode          ON references TYPE string;
+DEFINE FIELD snapshot_text ON references TYPE option<string>;
+DEFINE FIELD snapshot_at   ON references TYPE option<datetime>;
 ```
 
 ---
@@ -968,6 +975,15 @@ SELECT * FROM thing WHERE postponed_count > 2
     к: thing
     поля:
       - label: текст
+
+  references:
+    описание: блок ссылается на другой блок с тремя режимами поведения
+    от: thing   # блок-источник (документ, параграф, embed-контейнер)
+    к: thing    # блок-цель (любой thing с text)
+    поля:
+      - mode: текст           # live / snapshot / link
+      - snapshot_text: текст  # для mode=snapshot: замороженный текст цели на момент фиксации
+      - snapshot_at: дата     # когда был сделан снапшот
 ```
 
 ---
@@ -1780,6 +1796,161 @@ SELECT * FROM thing WHERE ->part_of->thing = thing:people
 SELECT DISTINCT
   (SELECT ->assigned_to->thing.* FROM thing WHERE ->about->thing = thing:case_1),
   (SELECT ->participant->thing.* FROM thing WHERE ->about->thing = thing:case_1);
+```
+
+---
+
+## Сценарий: блочные документы и трансклюзия
+
+Документ — `thing`-контейнер. Блоки (параграфы, заголовки, рисунки) — `thing` с `part_of`
+и полем `order` на ребре для порядка. Блок может включать другой блок тремя способами
+через ребро `references`.
+
+### Три режима включения
+
+| Режим | Поведение при рендере | Что хранится |
+|-------|----------------------|--------------|
+| `live` | Показать актуальный `text` цели | Только ребро |
+| `snapshot` | Показать `snapshot_text` с ребра | Ребро + копия текста + дата |
+| `link` | Показать кликабельную ссылку | Только ребро |
+
+### Структура документа
+
+```mermaid
+graph TD
+    Article[Статья: Кристаллизация\nkind: document\nstatus: черновик]
+
+    Abs[Абстракт\ntype: paragraph\norder: 1]
+    S1[Раздел: Введение\ntype: heading\norder: 2]
+    S2[Раздел: Методология\ntype: heading\norder: 3]
+    S3[Раздел: Результаты\ntype: heading\norder: 4]
+
+    P1[Параграф введения\ntype: paragraph\norder: 1]
+    DefEmbed[Embed-блок\ntype: embed\norder: 2]
+    Definition[Определение кристаллизации\ntype: paragraph]
+
+    ProtoEmbed[Embed-блок\ntype: embed\norder: 1]
+    Protocol[Протокол опыта №3\ntype: paragraph]
+
+    ResultSnap[Снапшот таблицы\ntype: snapshot\norder: 1]
+    Table[Таблица измерений\ntype: paragraph]
+
+    Abs -->|part_of, order:1| Article
+    S1  -->|part_of, order:2| Article
+    S2  -->|part_of, order:3| Article
+    S3  -->|part_of, order:4| Article
+
+    P1      -->|part_of, order:1| S1
+    DefEmbed -->|part_of, order:2| S1
+    DefEmbed -->|references, mode:live| Definition
+
+    ProtoEmbed -->|part_of, order:1| S2
+    ProtoEmbed -->|references, mode:live| Protocol
+
+    ResultSnap -->|part_of, order:1| S3
+    ResultSnap -->|references, mode:snapshot\nsnapshot_at: 18 мая| Table
+
+    Article -->|about| Topic[Тема: кристаллизация]
+    Article -->|about| Experiment[Опыт №3]
+    Article -->|produces| Publication[Публикация в журнале]
+```
+
+**Протокол** живёт в записи Опыта №3. Статья включает его через `live` — при редактировании
+протокола статья обновляется автоматически везде.
+
+**Таблица результатов** зафиксирована снапшотом на дату публикации. Если данные
+в лабораторном журнале пересчитают — статья не изменится.
+
+### Снапшот: обновление вручную
+
+```mermaid
+graph LR
+    Snap[references\nmode: snapshot\nsnapshot_text: старый текст\nsnapshot_at: 1 мая]
+    Original[Оригинальный блок\ntext: новый текст]
+
+    Snap -->|к| Original
+```
+
+Пользователь видит предупреждение: "Источник изменился с момента снапшота".
+Нажимает "обновить" → `snapshot_text` копируется из `original.text`, `snapshot_at` обновляется.
+
+### Ссылка внутри текста
+
+Блок может содержать разметку `[[thing:block_id]]` прямо в поле `text`.
+Рендерер разбирает текст и создаёт кликабельные ссылки.
+Для graph-запросов дублируется как ребро `references, mode: link`:
+
+```
+text: "Как показано в [[thing:table_results]], зависимость..."
+→ references, mode:link → thing:table_results
+```
+
+Оба представления нужны: `text` — для редактора, ребро — для запросов "где используется блок".
+
+### Тип блока
+
+Поле `type` на блоках:
+
+| `type` | Описание |
+|--------|---------|
+| `paragraph` | Обычный текст |
+| `heading` | Заголовок раздела (+ поле `level`: 1/2/3) |
+| `figure` | Рисунок или изображение |
+| `formula` | Математическая формула |
+| `code` | Блок кода |
+| `embed` | Контейнер для live-трансклюзии |
+| `snapshot` | Контейнер для зафиксированного снапшота |
+| `citation` | Ссылка на источник |
+| `callout` | Выноска / предупреждение |
+
+### Источники и цитаты
+
+Источник — `thing` с полями `author`, `year`, `doi`, `url`. Цитата — `references, mode: link`
+из блока на источник. Статья агрегирует все источники через graph-запрос.
+
+```mermaid
+graph TD
+    Article[Статья]
+    P2[Параграф 2]
+    Cite1[references\nmode: link]
+    Cite2[references\nmode: link]
+    Src1[Smith 2020\nauthor: Smith J.\nyear: 2020\ndoi: 10.1234/...]
+    Src2[Jones 2019\nauthor: Jones A.\nyear: 2019\nurl: ...]
+
+    P2 -->|part_of| Article
+    P2 -->|references, mode:link| Src1
+    P2 -->|references, mode:link| Src2
+```
+
+```surql
+-- Все источники статьи
+SELECT ->references->thing[WHERE year != NONE].*
+FROM thing WHERE ->part_of->thing = thing:article_crystallization
+  AND mode = "link";
+
+-- Все места где используется блок (live + snapshot)
+SELECT <-references<-thing[WHERE mode IN ["live","snapshot"]].*
+FROM thing:block_protocol_3;
+
+-- Снапшоты которые устарели (источник изменился после снапшота)
+SELECT * FROM references
+  WHERE mode = "snapshot"
+  AND ->thing.updated_at > snapshot_at;
+
+-- Все блоки статьи по порядку (только верхний уровень)
+SELECT <-part_of<-thing[WHERE type != NONE].*,
+       <-part_of.order AS порядок
+FROM thing:article_crystallization
+ORDER BY порядок ASC;
+
+-- Рекурсивно весь документ с вложенными блоками
+SELECT <-part_of<-thing.* FROM thing:article_crystallization DEPTH 10;
+
+-- Обновить снапшот
+UPDATE references SET
+  snapshot_text = (SELECT text FROM thing WHERE id = ->thing)[0].text,
+  snapshot_at = time::now()
+WHERE id = references:snap_table_results;
 ```
 
 ---
