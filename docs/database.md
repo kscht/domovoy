@@ -7113,6 +7113,110 @@ ORDER BY created_at DESC;
 
 ---
 
+## Блокировки (locking)
+
+Лок — операционное состояние, а не граф-отношение. Хранится как поля на `thing` (schemaless — без изменений схемы и без миграций). Два сценария: пользователь явно блокирует каскад для редактирования, или AI/воркер генерирует каскад и узлы ещё не готовы.
+
+### Поля блокировки
+
+```
+-- Пользовательский лок
+locked_by:          record<thing>   ← пользователь, агент или воркер
+lock_type:          string          ← "редактирование" | "публикация" | "ревью" | "генерация"
+lock_scope:         string          ← "узел" | "каскад"
+lock_expires_at:    datetime
+lock_reason:        string
+
+-- Генерация AI или внешнего модуля
+status:                  "генерируется"
+generating_by:           record<thing>   ← агент-ai или воркер
+generation_started_at:   datetime
+generation_timeout_at:   datetime        ← дедлайн, после которого лок сбрасывается
+```
+
+### Каскадный лок
+
+`lock_scope: "каскад"` означает, что блокировка распространяется на всё поддерево через `part_of`. При проверке обходим предков:
+
+```surql
+-- Заблокирован ли узел или любой его предок?
+SELECT id FROM thing
+WHERE id = $node_id
+  AND (
+       locked_by != NONE
+    OR ->part_of->thing.locked_by != NONE
+    OR ->part_of->thing->part_of->thing.locked_by != NONE
+  );
+
+-- Все узлы под заблокированным каскадом
+SELECT id, name, kind FROM thing
+WHERE ->part_of->thing[WHERE locked_by != NONE AND lock_scope = "каскад"] != NONE;
+```
+
+### Автосброс зависших локов
+
+Если пользователь закрыл браузер или воркер упал — лок не должен висеть вечно. DEFINE EVENT сбрасывает просроченные блокировки:
+
+```surql
+-- Сброс пользовательского лока по истечении времени
+DEFINE EVENT unlock_expired ON TABLE thing
+  WHEN $after.lock_expires_at != NONE
+    AND $after.lock_expires_at < time::now()
+THEN {
+  UPDATE $after.id SET
+    locked_by         = NONE,
+    lock_type         = NONE,
+    lock_scope        = NONE,
+    lock_expires_at   = NONE,
+    lock_reason       = NONE;
+};
+
+-- Сброс генерации по таймауту (воркер завис)
+DEFINE EVENT generation_timeout ON TABLE thing
+  WHEN $after.generation_timeout_at != NONE
+    AND $after.generation_timeout_at < time::now()
+    AND $after.status = "генерируется"
+THEN {
+  UPDATE $after.id SET
+    status                 = "ошибка-генерации",
+    generating_by          = NONE,
+    generation_started_at  = NONE,
+    generation_timeout_at  = NONE;
+};
+```
+
+### Типовые запросы
+
+```surql
+-- Все активные блокировки в системе
+SELECT name, kind, locked_by.name AS кто, lock_type, lock_scope,
+       lock_expires_at, lock_reason
+FROM thing
+WHERE locked_by != NONE
+ORDER BY lock_expires_at ASC;
+
+-- Все узлы, которые сейчас генерируются
+SELECT name, kind, generating_by.name AS агент,
+       generation_started_at,
+       generation_timeout_at
+FROM thing
+WHERE status = "генерируется"
+ORDER BY generation_started_at ASC;
+
+-- Мои активные блокировки
+SELECT name, kind, lock_type, lock_scope, lock_expires_at
+FROM thing
+WHERE locked_by = $auth AND locked_by != NONE;
+
+-- Снять все мои блокировки
+UPDATE thing SET
+  locked_by = NONE, lock_type = NONE,
+  lock_scope = NONE, lock_expires_at = NONE, lock_reason = NONE
+WHERE locked_by = $auth;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
