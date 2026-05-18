@@ -4186,6 +4186,211 @@ WHERE _shadow = true
   );
 ```
 
+## Сценарий: небольшая коммерция
+
+Жена продаёт поделки, семена, саженцы и БУ-вещи. Всё это уже вещи в инвентаре —
+нужны только объявления, заказы и связи между ними.
+
+### Объявление (листинг)
+
+```
+thing:listing_tomato_seeds
+  kind: объявление
+  price: 100
+  price_unit: "за 10 шт"
+  quantity_available: 150
+  status: активно            ← активно | снято | распродано
+  → about       → thing:seeds_tomato_own   ← что продаётся (из инвентаря)
+  → assigned_to → thing:mom                ← продавец
+  → can_access  ← thing:public             ← видно всем
+```
+
+Типы листингов:
+
+| Тип | Признак | Пример |
+|-----|---------|--------|
+| Готовый товар | `quantity_available > 1` | пакеты семян |
+| Уникальный | `quantity_available: 1` | конкретная поделка |
+| Предзаказ | `available_from: дата` | саженцы осенью |
+| Кастомный | нет листинга, заказ напрямую | "сделай вот такой венок" |
+
+### Заказ
+
+Покупатель — `participant, role: заказчик`. Роль уже есть в модели.
+
+```
+thing:order_001
+  kind: заказ
+  status: новый              ← новый | подтверждён | оплачен | собирается | отправлен | выполнен | отменён
+  amount: 300
+  notes: "3 пакета помидоров черри"
+  created_at: 2026-05-19
+  → about       → thing:listing_tomato_seeds   ← что заказали
+  → assigned_to → thing:mom                    ← исполнитель
+  → participant[role: заказчик] → thing:customer_anna
+  → produces    → thing:payment_001
+  → produces    → thing:shipment_001
+```
+
+При выполнении заказа — инвентарь уменьшается через `used`:
+
+```surql
+RELATE thing:order_001->used->thing:seeds_tomato_own SET quantity = 30, unit = "шт";
+UPDATE thing:listing_tomato_seeds SET quantity_available -= 30;
+```
+
+### Предзаказ: саженцы осенью
+
+Покупатель заказывает весной — доставка в октябре. Заказ сразу создаёт задачу в будущем:
+
+```mermaid
+graph TD
+    Customer[Пётр\nпокупатель]
+    Order[Заказ: саженцы антоновки 2шт\nstatus: подтверждён\ndeadline: 1 октября]
+    Task[Задача: выкопать саженцы\ndeadline: 1 октября\nstatus: не начато]
+    Payment[Оплата: 500р\nstatus: ожидает]
+    Shipment[Отправка\nstatus: не начато]
+    Sapling[Яблоня Антоновка\nиз сада]
+
+    Customer -->|participant, заказчик| Order
+    Order -->|about| Sapling
+    Order -->|produces| Task
+    Order -->|produces| Payment
+    Task -->|produces| Shipment
+    Task -->|assigned_to| Mom[Мама]
+    Task -->|about| Sapling
+```
+
+```
+thing:order_sapling_apple
+  kind: заказ
+  status: подтверждён
+  amount: 500
+  deadline: 2026-10-01
+  notes: "антоновка, 2 штуки, самовывоз или СДЭК"
+  → about                      → thing:apple_tree_antonovka
+  → participant[role: заказчик] → thing:customer_petr
+  → assigned_to                → thing:mom
+  → produces                   → thing:task_dig_saplings
+  → produces                   → thing:payment_sapling
+
+thing:task_dig_saplings
+  name: "Выкопать саженцы антоновки — Пётр"
+  deadline: 2026-10-01
+  status: не начато
+  → assigned_to → thing:mom
+  → about       → thing:order_sapling_apple
+  → produces    → thing:shipment_sapling
+```
+
+Задача появится в планировщике на октябрь. Когда выполнена — `produces` создаёт отправку,
+отправка трекается как обычная доставка (уже в модели).
+
+### БУ-вещи
+
+Вещь уже в инвентаре — достаточно повесить листинг:
+
+```
+thing:listing_blender_old
+  kind: объявление
+  price: 1500
+  quantity_available: 1       ← уникальный товар
+  status: активно
+  → about → thing:blender_phillips   ← вещь из инвентаря
+  → can_access ← thing:public
+
+-- При продаже:
+UPDATE thing:listing_blender_old SET status = "распродано";
+RELATE thing:blender_phillips->lent_to->thing:customer_maria
+  SET since = time::now();    ← временно, пока не передали физически
+-- После передачи:
+-- contains переключается, lent_to убирается
+```
+
+### Кастомный заказ (без листинга)
+
+Клиент пишет напрямую: "сделай венок из сухоцветов, диаметр 30см":
+
+```
+thing:order_custom_wreath
+  kind: заказ
+  status: новый
+  amount: 800
+  notes: "венок из сухоцветов, D=30см, цвета: бежевый, терракотовый"
+  deadline: 2026-06-01
+  → participant[role: заказчик] → thing:customer_lena
+  → assigned_to                → thing:mom
+  → produces                   → thing:task_make_wreath
+  → produces                   → thing:payment_wreath
+
+thing:task_make_wreath
+  name: "Сделать венок для Лены"
+  deadline: 2026-05-28        ← раньше дедлайна заказа
+  → produces → thing:wreath_result   ← готовое изделие
+  → requires → thing:dried_flowers   ← расход материалов
+  → requires → thing:wire_frame
+```
+
+### Публичный магазин
+
+```
+thing:pub_moms_shop
+  kind: публикация
+  slug: "moms-garden"
+  live: true
+  → about → thing:shop_container
+  → can_access ← thing:public
+
+thing:shop_container
+  ├── thing:listing_tomato_seeds      (активно)
+  ├── thing:listing_cucumber_seeds    (активно)
+  ├── thing:listing_saplings_apple    (активно, available_from: сентябрь)
+  ├── thing:listing_bracelet_blue     (активно)
+  └── thing:listing_blender_old       (распродано)
+```
+
+### Аналитика
+
+```surql
+-- Выручка за месяц
+SELECT math::sum(amount) AS выручка
+FROM thing
+WHERE kind = "заказ"
+  AND status IN ["оплачен", "выполнен"]
+  AND created_at > time::now() - 30d;
+
+-- Что продаётся лучше
+SELECT ->about->thing.name AS товар, count() AS заказов,
+       math::sum(amount) AS выручка
+FROM thing
+WHERE kind = "заказ" AND status != "отменён"
+GROUP BY ->about->thing
+ORDER BY заказов DESC;
+
+-- Ожидающие заказы с дедлайном
+SELECT name, status, deadline, amount,
+       ->participant[role = "заказчик"]->thing.name AS покупатель
+FROM thing
+WHERE kind = "заказ"
+  AND status NOT IN ["выполнен", "отменён"]
+ORDER BY deadline ASC;
+
+-- Запас: что заканчивается
+SELECT ->about->thing.name AS товар, quantity_available
+FROM thing
+WHERE kind = "объявление" AND status = "активно"
+  AND quantity_available < 10
+ORDER BY quantity_available ASC;
+
+-- Будущие задачи из предзаказов
+SELECT name, deadline, ->about->thing.name AS заказ,
+       ->participant[role = "заказчик"]->thing.name AS покупатель
+FROM thing
+WHERE kind = "задача" AND status = "не начато"
+  AND <-produces<-thing.kind = "заказ"
+ORDER BY deadline ASC;
+```
+
 ---
 
 ## Открытые вопросы
