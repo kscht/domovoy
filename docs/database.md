@@ -2062,9 +2062,226 @@ FROM thing:notary_petrova;
 
 ---
 
+## Сценарий: серверные AI-пайплайны
+
+Общий паттерн: медиа-вход с телефона → очередь → сервер обрабатывает → результат
+в граф. Телефон не тратит ресурсы на AI — только записывает и отправляет.
+
+### Общая структура
+
+```
+thing:input (type: voice_note / photo / scan / document)
+  filename: "..."           ← бинарник в vault целевого узла
+  status: не начато         ← сервер мониторит это поле
+  → about       → thing:target   ← куда прикрепить результат
+  → assigned_to → Мама
+
+↓ сервер забирает
+
+thing:task_process
+  → depends_on  → input
+  → assigned_to → thing:ai_*     ← AI-инструмент как thing-узел
+  → produces    → структурированный результат
+```
+
+`status` на входящем медиа: `не начато` → `в процессе` → `выполнено` / `ошибка`
+
+### AI-инструменты как узлы
+
+| Узел | Роль |
+|------|------|
+| `thing:ai_whisper` | Speech-to-text |
+| `thing:ai_claude` | Разбор текста, структурирование, перевод |
+| `thing:ai_vision` | Распознавание изображений, OCR |
+| `thing:ai_tts` | Text-to-speech (ElevenLabs и др.) |
+| `thing:service_barcode` | Lookup по штрихкоду / ISBN |
+
+---
+
+### 1. Голосовой ввод в список покупок
+
+Жена диктует список — телефон только пишет аудио, сервер транскрибирует и парсит.
+
+```mermaid
+graph TD
+    Mom[Мама]
+    Voice[Голосовая заметка\ntype: voice_note\nstatus: не начато\nfilename: dictation.m4a]
+    List[Список покупок\nмай 2026]
+    Transcription[Расшифровка\ntext: молоко 2л хлеб яйца десяток]
+
+    Milk[Молоко\nneeds qty:2 unit:л]
+    Bread[Хлеб]
+    Eggs[Яйца\nneeds qty:10]
+
+    Mom -->|assigned_to| Voice
+    Voice -->|about| List
+    Voice -->|produces| Transcription
+    Transcription -->|about| Voice
+    List -->|needs| Milk
+    List -->|needs| Bread
+    List -->|needs| Eggs
+```
+
+---
+
+### 2. Голосовая команда → задача
+
+"Напомни купить масло для мотоцикла до пятницы" — AI разбирает намерение и создаёт задачу.
+
+```
+Voice command → ai_whisper → text
+             → ai_claude  → thing:task
+                              name: "Купить масло для мотоцикла"
+                              deadline: 2026-05-22
+                              → about → thing:motorcycle
+                              → assigned_to → Папа
+```
+
+AI определяет: объект (`мотоцикл`), действие (`купить масло`), срок (`пятница`).
+Если объект найден в графе — ставит `about`. Если нет — создаёт или оставляет в Inbox.
+
+---
+
+### 3. Голосовое в обсуждении → транскрипция
+
+Голосовое сообщение в чате под задачей — транскрибируется на сервере, отображается
+как обычное текстовое сообщение рядом с кнопкой воспроизведения.
+
+```
+thing:voice_msg
+  type: voice_note
+  filename: "msg_14-32.m4a"
+  text: null                 ← до обработки
+  → about → thing:task_motorcycle_service
+  → assigned_to → Папа
+
+после обработки:
+  text: "фильтр уже купил, завтра сделаю ТО"
+  status: выполнено
+```
+
+Сообщение становится частью обсуждения — поток `about` задачи, упорядоченный по `created_at`.
+
+---
+
+### 4. Фото чека → расходы
+
+Сфотографировал чек в магазине — AI распознаёт позиции и цены, создаёт записи расходов.
+
+```mermaid
+graph TD
+    Photo[Фото чека\ntype: photo\nfilename: receipt.jpg\nstatus: не начато]
+    Vision[ai_vision: OCR чека]
+    Claude[ai_claude: структурирование]
+
+    Expense[Расход: Пятёрочка\ndate: 18 мая\ntotal: 1840р]
+    I1[Молоко 2л — 98р]
+    I2[Хлеб — 45р]
+    I3[Яйца 10шт — 120р]
+
+    Photo -->|produces| Expense
+    Expense -->|part_of| I1
+    Expense -->|part_of| I2
+    Expense -->|part_of| I3
+    Photo -->|about| Expense
+```
+
+Если позиция уже есть в инвентаре — `about` связывает расход с вещью. История трат
+по любому продукту — запрос по `about` цепочке.
+
+---
+
+### 5. Скан документа / письма → задача
+
+Пришло письмо из налоговой — сфотографировал, AI читает, выделяет срок и действие.
+
+```
+Photo → ai_vision (OCR) → text
+      → ai_claude (разбор) → thing:task
+                               name: "Подать декларацию 3-НДФЛ"
+                               deadline: 2026-07-31
+                               priority: высокий
+                               → about → thing:file_letter_scan
+                               → filed_with → thing:nalog_service
+```
+
+Скан письма остаётся в vault — `about` связывает задачу с источником.
+Если в письме упомянута инстанция из графа — `filed_with` проставляется автоматически.
+
+---
+
+### 6. Штрихкод / QR → инвентарь
+
+Отсканировал штрихкод на упаковке — приложение ищет товар в базе или через внешний API.
+
+```
+Scan event
+  → thing:service_barcode (lookup by EAN-13)
+  → produces → thing:item
+                 name: "Масло моторное Castrol 5W-40"
+                 quantity: 1
+                 unit: л
+                 price: 890
+                 url: "https://..."
+                 → contains → thing:garage   ← куда добавить
+```
+
+Если товар уже есть в базе — увеличивает `quantity`. Если нет — создаёт новый узел.
+QR-код документа — открывает соответствующий `thing`-узел напрямую по ID.
+
+---
+
+### 7. Локализация видео (полный пайплайн)
+
+Скачать иноязычное видео → субтитры (AI) → перевод (AI) → ручная правка → TTS → монтаж.
+
+```mermaid
+graph LR
+    V[Исходное видео\nfilename: tutorial.mp4]
+    S[Субтитры EN\ntype: paragraph\ntext: SRT-контент]
+    R[Перевод RU draft\ntype: paragraph]
+    F[Перевод RU final\ntype: paragraph]
+    A[Аудиодорожка RU\nfilename: audio_ru.mp3]
+    Out[Финальное видео\nfilename: tutorial_ru.mp4]
+    Lesson[Урок: FreeCAD Эскизы\n→ about → Сын]
+
+    V -->|produces| S
+    S -->|produces| R
+    R -->|produces| F
+    F -->|produces| A
+    V -->|produces| Out
+    A -->|produces| Out
+    Out -->|produces| Lesson
+```
+
+Каждый `produces` — задача с `depends_on` на предыдущий и `assigned_to` нужному AI-инструменту
+или человеку (ручная правка → Папа).
+
+---
+
+```surql
+-- Все необработанные медиа-входы (очередь для сервера)
+SELECT * FROM thing
+  WHERE type IN ["voice_note", "photo", "scan"]
+  AND status = "не начато"
+  ORDER BY created_at ASC;
+
+-- Результаты конкретного пайплайна (что породил вход)
+SELECT ->produces->thing.* FROM thing:voice_note_may18 DEPTH 5;
+
+-- Расходы по конкретному продукту за последние 3 месяца
+SELECT ->about<-thing[WHERE ->part_of->thing != NONE].* FROM thing:milk
+  WHERE created_at > time::now() - 90d;
+
+-- Задачи созданные из писем / сканов
+SELECT * FROM thing WHERE status != "выполнено"
+  AND ->about->thing[WHERE type IN ["photo","scan"]] != NONE;
+```
+
+---
+
 ## Открытые вопросы
 
 - [ ] История перемещений вещей?
 - [ ] Повторяющиеся задачи — шаблон с расписанием (каждую субботу, каждые 10000 км)?
 - [ ] Уведомления — push или только в приложении?
-- [ ] Штрихкоды / QR-коды при добавлении?
