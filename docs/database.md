@@ -8671,6 +8671,395 @@ WHERE kind = "файл"
 
 ---
 
+## Расширенный обучающий слой
+
+Домовой строит обучение вокруг трёх идей, которых нет в существующих LMS:
+
+1. **Личный контекст** — квиз про Kubernetes задаёт вопросы о ТВОЁМ реальном кластере из графа.
+2. **Одноразовые среды** — реальный сервер/БД на время лабы, provisioned плейбуком.
+3. **Единое состояние** — SM-2 карточки накапливают знания поверх всех попыток и курсов.
+
+### Разделение «что учить» и «состояние обучения»
+
+```
+SHARED — ноль копий на студента (контент курса)
+  kind: учебный-путь
+  kind: курс
+  kind: модуль
+  kind: урок
+  kind: контент-блок
+  kind: вопрос
+  kind: лаборатория
+  kind: достижение
+
+PER-STUDENT — одна на студента на курс
+  kind: прохождение-курса   ← enrollment, stable node
+  kind: карточка-повторения ← SM-2 state, не сбрасывается при перепрохождении
+
+PER-ATTEMPT — одна на каждое прохождение
+  kind: попытка-курса
+    → kind: попытка-урока
+      → kind: попытка-вопроса
+      → kind: попытка-лабы
+```
+
+Несколько студентов на одном курсе не дублируют контент. Перепрохождение создаёт новую `попытка-курса`, enrollment не трогается.
+
+### Структура контента
+
+```
+kind: учебный-путь
+  name: "Стать DevOps-инженером"
+  contains → kind: курс  (ordered, depends_on для prerequisites)
+
+kind: курс
+  name: "Kubernetes для администраторов"
+  level: "beginner" | "intermediate" | "advanced"
+  language: "ru"
+  estimated_hours: 12
+  depends_on → kind: курс  (prerequisite)
+  contains → kind: модуль
+
+kind: модуль
+  name: "Pods и Deployments"
+  order: 2
+  part_of → kind: курс
+  contains → kind: урок
+
+kind: урок
+  name: "Жизненный цикл пода"
+  order: 1
+  part_of → kind: модуль
+  contains → kind: контент-блок  (ordered)
+  produces → kind: вопрос  (автогенерация AI)
+```
+
+### kind: контент-блок
+
+Атомарная единица урока. Блоки идут последовательно, каждый с типом:
+
+```yaml
+kind: контент-блок
+order: 3
+block_type: текст | видео | аудио | задание | квиз | лаб | карточки
+part_of: thing:lesson_pod_lifecycle
+
+# для текста
+content: "## Фазы пода\n\nPending → Running → Succeeded..."
+format: markdown
+
+# для видео (YouTube-клип)
+source: youtube
+youtube_id: "dQw4w9WgXcQ"
+start_sec: 120
+end_sec: 340
+transcript: "..."   ← сгенерирован Whisper или YouTube API
+caption_lang: ru
+
+# для аудио (аудирование, языки)
+audio_file: thing:file_audio_xyz
+transcript: "The pod is in a Pending state"
+```
+
+### Расширенные типы вопросов
+
+```yaml
+kind: вопрос
+type: выбор | множественный-выбор | текстовый-ввод | код |
+      sql | bash | аудирование | произношение | соответствие
+
+# общие поля
+text: "Что произойдёт если liveness probe падает 3 раза подряд?"
+points: 10
+difficulty: 1-5         ← влияет на SM-2 ease_factor
+hint: "Проверь параметр failureThreshold"
+explanation: "Kubelet перезапустит контейнер..."
+tags: ["kubernetes", "probes"]
+
+# для выбор / множественный-выбор
+options:
+  - { text: "Pod удаляется", correct: false }
+  - { text: "Контейнер перезапускается", correct: true }
+  - { text: "Node перезагружается", correct: false }
+
+# для текстовый-ввод (AI-проверка)
+model_answer: "Kubelet перезапустит контейнер согласно restartPolicy"
+rubric: "Упомянуть: kubelet, перезапуск, restartPolicy"
+check_method: ai-rubric | exact-match | regex | similarity
+
+# для код / sql / bash
+starter_code: "SELECT * FROM ..."
+expected_output: "42"
+check_method: run-and-compare | schema-check | test-suite
+language: python | sql | bash | javascript | surreal
+
+# для аудирование (языки)
+audio_file: thing:file_audio_sentence
+correct_transcript: "The weather is nice today"
+acceptable_variants: ["The weather's nice today"]
+tolerance_pct: 90       ← similarity threshold
+
+# для произношение
+prompt_text: "Скажите: 'Pronunciation practice'"
+check_method: stt-similarity
+target_phonemes: [...]
+
+# для соответствие
+pairs:
+  - { left: "Pod", right: "Минимальная единица деплоя" }
+  - { left: "Node", right: "Физическая или виртуальная машина" }
+```
+
+### Одноразовые лабораторные среды
+
+```yaml
+kind: лаборатория
+name: "SQL: агрегации и GROUP BY"
+lab_type: sql | bash | kubernetes | docker | surreal | python | git
+environment:
+  image: "postgres:16"
+  cpu: "0.5"
+  memory: "512m"
+  lifetime_min: 60
+
+# начальное состояние (DDL + данные)
+setup_script: |
+  CREATE TABLE orders (id SERIAL, amount DECIMAL, status TEXT);
+  INSERT INTO orders VALUES (1, 150.00, 'paid'), (2, 200.00, 'pending');
+
+# задание для студента
+tasks:
+  - "Посчитайте сумму заказов по каждому статусу"
+  - "Выведите только статусы с суммой > 100"
+
+# проверочный скрипт (запускается после submit)
+check_script: |
+  SELECT status, SUM(amount) FROM orders GROUP BY status HAVING SUM(amount) > 100;
+expected_result_hash: "abc123"   ← или check_method: semantic (AI сравнивает)
+
+# для bash/k8s лаб
+check_method: script | ai-review | both
+```
+
+**Provisioning среды через плейбук:**
+
+```mermaid
+graph LR
+    Student["Студент\nнажал Start Lab"]
+    PB["kind: плейбук\nЗапустить учебную среду"]
+    S1["kind: шаг\nСоздать pod/container"]
+    S2["kind: шаг\nПрименить setup_script"]
+    S3["kind: шаг\nОбновить учебную-среду\nstatus: готова"]
+    S4["kind: шаг\nЗапустить таймер истечения"]
+    Env["kind: учебная-среда\nstatus: готова\nconnection_url: ..."]
+
+    Student --> PB
+    PB --> S1 --> S2 --> S3 --> S4
+    S3 --> Env
+```
+
+```yaml
+kind: учебная-среда
+status: запускается | готова | завершена | истекла | ошибка
+connection_url: "postgres://student:pwd@lab-xyz.home:5432/lab"
+web_terminal_url: "https://домовой.home/lab/xyz/terminal"
+expires_at: datetime
+part_of: thing:attempt_lab_sql_001    ← привязана к попытке
+about: thing:lab_sql_aggregations     ← какая лаба
+assigned_to: thing:user_me
+```
+
+Истечение через уже спроектированный DEFINE EVENT → статус `"истекла"` → плейбук удаляет контейнер/pod.
+
+### Автогенерация контента из YouTube
+
+```
+Плейбук "YouTube → Курс":
+  шаг 1: YouTube Data API → метаданные, транскрипт
+  шаг 2: Whisper (если нет транскрипта) → текст
+  шаг 3: AI-агент → summary, ключевые концепции, вопросы ×10, карточки ×20
+  шаг 4: Создать контент-блок (видео) + вопросы + карточки в графе
+  шаг 5: Уведомить пользователя
+```
+
+Весь процесс — один плейбук, запускается по URL YouTube-клипа.
+
+### Прогресс и перепрохождение
+
+```yaml
+kind: прохождение-курса          # enrollment — stable, один на студента на курс
+student: thing:user_me
+course: thing:course_k8s_admin
+enrolled_at: datetime
+best_score: 85
+best_attempt: thing:attempt_course_2
+total_attempts: 3
+current_attempt: thing:attempt_course_3   # активная попытка
+
+kind: попытка-курса              # одна на каждое прохождение
+attempt_number: 3
+status: в-процессе | завершена | заброшена
+started_at: datetime
+completed_at: datetime
+score: 72
+xp_earned: 340
+part_of: thing:enrollment_k8s_me    # ← прохождение-курса
+# дочерние попытки уроков через part_of ↓
+
+kind: попытка-урока
+lesson: thing:lesson_pod_lifecycle
+status: завершён | пропущен
+score: 90
+time_spent_sec: 420
+part_of: thing:attempt_course_3
+
+kind: попытка-вопроса
+answer: "Контейнер перезапускается kubelet-ом"
+is_correct: true
+score: 10
+time_spent_sec: 23
+part_of: thing:attempt_lesson_xyz
+answered → kind: вопрос           # ← уже существующее ребро
+
+kind: попытка-лабы
+submitted_at: datetime
+result: passed | failed | timeout
+check_output: "Expected: 42, Got: 42 ✓"
+part_of: thing:attempt_lesson_xyz
+about: thing:lab_sql_aggregations
+```
+
+**Перепрохождение** — только новая `попытка-курса`, enrollment не трогается:
+
+```surql
+-- Начать новое прохождение
+LET $new_attempt = CREATE thing SET
+  kind = "попытка-курса",
+  attempt_number = $enrollment.total_attempts + 1,
+  status = "в-процессе",
+  started_at = time::now(),
+  part_of = $enrollment_id;
+
+UPDATE $enrollment_id SET
+  total_attempts += 1,
+  current_attempt = $new_attempt.id;
+```
+
+Карточки SM-2 (`kind: карточка-повторения`) при перепрохождении **не сбрасываются** — они накапливают знания поверх всей истории попыток и курсов.
+
+### Интервальное повторение (SM-2)
+
+```yaml
+kind: карточка-повторения
+question: thing:question_xyz      # shared вопрос
+student: thing:user_me
+next_review: datetime
+interval_days: 7
+ease_factor: 2.5                  # 1.3–2.5, снижается при ошибках
+review_count: 12
+last_result: снова | плохо | хорошо | легко
+```
+
+SM-2 обновляется при каждом `попытка-вопроса.is_correct`. AI-агент может дополнительно снижать `ease_factor` для вопросов, где студент даёт правильный ответ но медленно.
+
+Расписание повторений создаётся как `kind: расписание` → `triggered_by` → сессия повторения.
+
+### Адаптивность и личный контекст
+
+**Адаптивная сложность** — AI-агент анализирует все `попытки-вопроса` студента и:
+- Генерирует дополнительные вопросы по слабым темам
+- Снижает difficulty следующей попытки
+- Рекомендует дополнительные уроки через `related_to`
+
+**Личный контекст** — квиз может задавать вопросы о данных студента из графа:
+
+```yaml
+kind: вопрос
+type: sql
+text: "Напишите запрос для получения всех инцидентов на ваших серверах за 30 дней"
+context_query: >         ← подгружается в условие задачи
+  SELECT name FROM thing WHERE kind = 'сервер'
+    AND <-can_access<-thing = $auth
+check_against: student_graph   ← проверка на реальных данных студента
+```
+
+### Достижения и сертификаты
+
+```yaml
+kind: достижение
+name: "Первый SQL-запрос"
+xp: 50
+condition: { completed_lab_type: "sql" }
+icon: "trophy"
+
+kind: выдача-достижения
+achievement: thing:achievement_first_sql
+student: thing:user_me
+earned_at: datetime
+part_of: thing:attempt_course_xyz
+
+kind: сертификат-курса
+student: thing:user_me
+course: thing:course_k8s_admin
+issued_at: datetime
+score: 92
+attempt: thing:attempt_course_2
+produces → kind: файл   ← PDF-сертификат в vault
+```
+
+### SurrealQL: типовые запросы
+
+```surql
+-- Прогресс студента по всем курсам
+SELECT ->about->thing.name AS курс,
+       best_score, total_attempts,
+       time::duration(enrolled_at - time::now()) AS учится,
+       current_attempt.status AS статус
+FROM thing
+WHERE kind = "прохождение-курса" AND student = $auth;
+
+-- Слабые темы по тегам вопросов (все попытки)
+SELECT ->answered->thing.tags AS тема,
+       count() AS попыток,
+       math::sum(score) / count() AS точность
+FROM thing
+WHERE kind = "попытка-вопроса"
+  AND ->part_of->thing->part_of->thing->part_of->thing.student = $auth
+  AND is_correct = false
+GROUP BY тема
+ORDER BY точность ASC LIMIT 10;
+
+-- Карточки к повторению сегодня
+SELECT ->question->thing.{ text, type, difficulty } AS вопрос,
+       next_review, interval_days, ease_factor
+FROM thing
+WHERE kind = "карточка-повторения"
+  AND student = $auth
+  AND next_review <= time::now()
+ORDER BY next_review ASC;
+
+-- Активные лабораторные среды
+SELECT ->about->thing.name AS лаба,
+       status, connection_url,
+       time::duration(expires_at - time::now()) AS осталось
+FROM thing
+WHERE kind = "учебная-среда"
+  AND assigned_to = $auth
+  AND status = "готова";
+
+-- Сравнение попыток курса
+SELECT attempt_number, score, xp_earned,
+       time::duration(completed_at - started_at) AS затрачено,
+       count(<-part_of<-thing[WHERE kind = "попытка-урока" AND status = "завершён"]) AS уроков
+FROM thing
+WHERE kind = "попытка-курса"
+  AND ->part_of->thing.student = $auth
+  AND ->part_of->thing.course = $course_id
+ORDER BY attempt_number ASC;
+```
+
+---
+
 ## Открытые вопросы
 
 - [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
