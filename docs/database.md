@@ -3,7 +3,8 @@
 ## Концепция
 
 Всё есть **вещь** (`thing`). Гараж, полка, мотоцикл, масло, рецепт, магазин, человек, семья,
-задача, подзадача — один тип узла. Смысл задаётся только рёбрами (связями) между вещами.
+задача, подзадача, платёж, обращение, инстанция — один тип узла.
+Смысл задаётся только рёбрами (связями) между вещами.
 
 ---
 
@@ -11,7 +12,7 @@
 
 | Таблица | Примеры |
 |---------|---------|
-| `thing` | предмет, место, контейнер, транспорт, человек, группа, задача, подзадача, рецепт, процедура, запуск, список |
+| `thing` | предмет, место, контейнер, транспорт, человек, группа, задача, подзадача, рецепт, процедура, запуск, список, платёж, обращение, решение, инстанция |
 
 Типичные поля по смыслу:
 
@@ -19,10 +20,12 @@
 |-------|------|
 | Любая вещь | `name`, `description`, `notes` |
 | Физический предмет | `quantity`, `unit`, `purchase_date`, `price` |
-| Задача | `status`, `deadline`, `priority` |
+| Задача / обращение | `status`, `deadline`, `priority` |
+| Периодический платёж | `amount`, `period`, `due_day`, `paid_until` |
 | Человек | `role` (папа, мама, сын, дочь, бабушка) |
 
-**`status` для задач:** `не начато` / `в процессе` / `выполнено` / `ожидает` / `отменено`
+**`status`:** `не начато` / `в процессе` / `выполнено` / `ожидает` / `отменено`  
+**`period`:** `ежедневно` / `еженедельно` / `ежемесячно` / `ежеквартально` / `ежегодно`
 
 ---
 
@@ -31,13 +34,14 @@
 | Связь | Описание | Поля на ребре |
 |-------|----------|---------------|
 | `contains` | Где физически находится вещь | `reason`, `since` |
-| `part_of` | Часть чего / подзадача родительской задачи / запуск шаблона | — |
-| `assigned_to` | Кто отвечает (человек или группа) | — |
+| `part_of` | Часть чего / подзадача / запуск шаблона | — |
+| `assigned_to` | Кто отвечает (человек, группа или вся семья) | — |
 | `depends_on` | Задача ждёт выполнения другой | — |
-| `about` | Задача или событие касается этой вещи | — |
+| `about` | Задача/обращение касается этой вещи или решения | — |
+| `filed_with` | Обращение подано в эту инстанцию/организацию | — |
 | `needs` | Что нужно купить (список → вещь) | `quantity`, `unit` |
 | `requires` | Плановый расход (шаблон → ингредиент/деталь) | `quantity`, `unit` |
-| `produces` | Результат выполнения шаблона | — |
+| `produces` | Результат выполнения (решение, документ, блюдо) | — |
 | `used` | Фактический расход при запуске | `quantity`, `unit` |
 | `related_to` | Произвольная связь с меткой | `label` |
 
@@ -46,9 +50,6 @@
 ---
 
 ## Люди и группы
-
-Семья — тоже `thing`. Люди `part_of` семьи. Задача может быть назначена как конкретному
-человеку, так и всей семье (открытая задача — берёт кто свободен).
 
 ```mermaid
 graph TD
@@ -66,46 +67,99 @@ graph TD
     Grandma -->|part_of| Family
 ```
 
-**Режим назначения:**
 - `assigned_to` → конкретный человек: личная ответственность
-- `assigned_to` → несколько людей: совместная ответственность
+- `assigned_to` → несколько людей: совместная
 - `assigned_to` → Семья: открытая задача, берёт кто свободен
 
 ---
 
-## Сценарий: открытые и личные задачи
+## Сценарий: периодические платежи
+
+Каждый периодический платёж — шаблон (`thing`) с расписанием.
+Каждая оплата — запуск (`run`), `part_of` шаблона.
 
 ```mermaid
 graph TD
-    Family[Семья]
     Dad[Папа]
-    Daughter[Дочь]
-    Mom[Мама]
+    Apartment[Квартира]
 
-    Barrel[Бочка для полива]
-    Kitchen[Кухня]
-    Grades[Дневник с оценками]
+    Electric[Шаблон: электричество\nperiod: ежемесячно\namount: ~3500р\ndue_day: 10]
+    Water[Шаблон: вода\nperiod: ежемесячно\namount: ~1800р\ndue_day: 10]
+    Internet[Шаблон: интернет\nperiod: ежемесячно\namount: 600р\ndue_day: 25]
+    HOA[Шаблон: УК / кап. ремонт\nperiod: ежемесячно\namount: ~4200р\ndue_day: 20]
 
-    T1[Задача: долить воду в бочку\nstatus: не начато]
-    T2[Задача: убраться на кухне\nstatus: не начато]
-    T3[Задача: проверить оценки\nstatus: ожидает]
+    RunElectric[Оплата электричества\nмай 2026\nstatus: выполнено]
+    RunWater[Оплата воды\nмай 2026\nstatus: не начато]
 
-    T1 -->|assigned_to| Family
-    T1 -->|about| Barrel
+    Electric -->|assigned_to| Dad
+    Electric -->|about| Apartment
+    Water -->|assigned_to| Dad
+    Water -->|about| Apartment
+    Internet -->|assigned_to| Dad
+    HOA -->|assigned_to| Dad
+    HOA -->|about| Apartment
 
-    T2 -->|assigned_to| Daughter
-    T2 -->|assigned_to| Mom
-    T2 -->|about| Kitchen
-
-    T3 -->|assigned_to| Dad
+    RunElectric -->|part_of| Electric
+    RunWater -->|part_of| Water
 ```
+
+Просроченные платежи — обычный запрос: `paid_until < сегодня`.
+
+---
+
+## Сценарий: юридические обращения
+
+Цепочка обжалований строится через `about` (это обращение обжалует то решение)
+и `filed_with` (подано в эту инстанцию).
+
+```mermaid
+graph TD
+    Dad[Папа]
+    Subject[Предмет спора\nнапр. земельный участок]
+
+    LocalAuth[Районная администрация]
+    RegionalAuth[Областная администрация]
+    Court[Суд первой инстанции]
+    AppCourt[Апелляционный суд]
+
+    Case1[Обращение №1\ndeadline: 15 июня\nstatus: выполнено]
+    Decision1[Отказ от 20 июня]
+
+    Case2[Обжалование №1\ndeadline: 20 июля\nstatus: выполнено]
+    Decision2[Частичный отказ от 5 авг]
+
+    Case3[Исковое заявление\ndeadline: 1 окт\nstatus: в процессе]
+    Decision3[Решение суда]
+
+    Case4[Апелляция\nstatus: не начато]
+
+    Case1 -->|assigned_to| Dad
+    Case1 -->|about| Subject
+    Case1 -->|filed_with| LocalAuth
+    Case1 -->|produces| Decision1
+
+    Case2 -->|assigned_to| Dad
+    Case2 -->|about| Decision1
+    Case2 -->|filed_with| RegionalAuth
+    Case2 -->|produces| Decision2
+
+    Case3 -->|assigned_to| Dad
+    Case3 -->|about| Decision2
+    Case3 -->|filed_with| Court
+    Case3 -->|produces| Decision3
+    Case3 -->|depends_on| Case2
+
+    Case4 -->|about| Decision3
+    Case4 -->|filed_with| AppCourt
+    Case4 -->|depends_on| Case3
+```
+
+Вся цепочка читается как путь по `about` и `produces`:  
+Обращение → решение → следующее обращение → решение → ...
 
 ---
 
 ## Сценарий: подзадачи
-
-Подзадача — это `thing` с `part_of` к родительской задаче. Никакого процента выполнения —
-только `status` на каждой подзадаче. Родительская задача выполнена когда все подзадачи выполнены.
 
 ```mermaid
 graph TD
@@ -120,101 +174,43 @@ graph TD
     T2 -->|part_of| Main
     T3 -->|part_of| Main
     T4 -->|part_of| Main
-
     T2 -->|depends_on| T1
 ```
 
 ---
 
-## Сценарий: ТО мотоцикла (задача + инвентарь)
+## Сценарий: открытые и личные задачи
 
 ```mermaid
 graph TD
+    Family[Семья]
     Dad[Папа]
-    Motorcycle[Мотоцикл]
-    Oil[Масло 10W-40\nquantity: 2л]
-    OilFilter[Фильтр масляный\nquantity: 0шт]
-    Task[Задача: ТО мотоцикла\ndeadline: 1 июня\nstatus: не начато]
-    ShoppingList[Список покупок]
-    Run[Запуск: ТО апрель 2026]
+    Daughter[Дочь]
+    Mom[Мама]
 
-    Task -->|assigned_to| Dad
-    Task -->|about| Motorcycle
-    Task -->|requires qty:4л| Oil
-    Task -->|requires qty:1шт| OilFilter
+    T1[Задача: долить воду в бочку\nstatus: не начато]
+    T2[Задача: убраться на кухне\nstatus: не начато]
+    T3[Задача: оплатить воду\ndeadline: 10 июня\nstatus: не начато]
 
-    OilFilter -->|quantity=0| ShoppingList
-    ShoppingList -->|needs qty:1шт| OilFilter
-
-    Run -->|part_of| Task
-    Run -->|used qty:4л| Oil
-    Run -->|used qty:1шт| OilFilter
-```
-
----
-
-## Сценарий: оценки в школе
-
-```mermaid
-graph TD
-    Son[Сын]
-    Dad[Папа]
-    School[Школа]
-    Grades[Дневник с оценками]
-
-    T1[Задача: принести оценки\ndeadline: пятница\nstatus: не начато]
-    T2[Задача: проверить оценки\nstatus: ожидает]
-
-    T1 -->|assigned_to| Son
-    T1 -->|about| School
-    T1 -->|produces| Grades
-    T2 -->|assigned_to| Dad
-    T2 -->|depends_on| T1
-    T2 -->|about| Grades
+    T1 -->|assigned_to| Family
+    T2 -->|assigned_to| Daughter
+    T2 -->|assigned_to| Mom
+    T3 -->|assigned_to| Dad
 ```
 
 ---
 
 ## Уведомления (логика приложения)
 
-Схема не меняется — уведомления это поведение приложения поверх графа:
-
 | Событие | Кто получает уведомление |
 |---------|--------------------------|
 | Новая задача `assigned_to` человек | Этот человек |
 | Новая задача `assigned_to` Семья | Все члены семьи |
 | Задача `depends_on` выполнена | Исполнитель следующей задачи |
-| Дедлайн задачи приближается | Исполнитель задачи |
-| `quantity` упало до нуля | Все (или `assigned_to` задачи на покупку) |
-
----
-
-## Жизненный цикл вещи
-
-```mermaid
-graph LR
-    A[нужно купить] -->|куплено| B[хранится]
-    B -->|транспорт| C[в пути]
-    C --> B
-    B -->|ремонт| D[в ремонте]
-    D --> B
-    B -->|used| E[израсходовано]
-    B -->|part_of| F[вошло в состав]
-    E -->|quantity=0| A
-```
-
-## Жизненный цикл задачи
-
-```mermaid
-graph LR
-    A[не начато] -->|назначена| B[назначена]
-    B -->|начата| C[в процессе]
-    C -->|заблокирована| D[ожидает]
-    D -->|разблокирована| C
-    C -->|выполнена| E[выполнено]
-    C -->|отменена| F[отменено]
-    E -->|повторяющаяся| A
-```
+| Дедлайн приближается (за 3 дня) | Исполнитель задачи |
+| `quantity` = 0 | Все (или исполнитель задачи на покупку) |
+| `paid_until` истекает | Исполнитель шаблона платежа |
+| Решение по обращению получено (`produces`) | Исполнитель следующего обращения |
 
 ---
 
@@ -227,13 +223,12 @@ DEFINE TABLE contains TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD reason ON contains TYPE option<string>;
 DEFINE FIELD since  ON contains TYPE option<datetime>;
 
-DEFINE TABLE part_of TYPE RELATION FROM thing TO thing;
-
+DEFINE TABLE part_of    TYPE RELATION FROM thing TO thing;
 DEFINE TABLE assigned_to TYPE RELATION FROM thing TO thing;
-
-DEFINE TABLE depends_on TYPE RELATION FROM thing TO thing;
-
-DEFINE TABLE about TYPE RELATION FROM thing TO thing;
+DEFINE TABLE depends_on  TYPE RELATION FROM thing TO thing;
+DEFINE TABLE about       TYPE RELATION FROM thing TO thing;
+DEFINE TABLE filed_with  TYPE RELATION FROM thing TO thing;
+DEFINE TABLE produces    TYPE RELATION FROM thing TO thing;
 
 DEFINE TABLE needs TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD quantity ON needs TYPE option<number>;
@@ -242,8 +237,6 @@ DEFINE FIELD unit     ON needs TYPE option<string>;
 DEFINE TABLE requires TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD quantity ON requires TYPE option<number>;
 DEFINE FIELD unit     ON requires TYPE option<string>;
-
-DEFINE TABLE produces TYPE RELATION FROM thing TO thing;
 
 DEFINE TABLE used TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD quantity ON used TYPE option<number>;
@@ -258,35 +251,32 @@ DEFINE FIELD label ON related_to TYPE string;
 ## SurrealQL: примеры запросов
 
 ```surql
--- Открытые задачи (assigned_to Семья) — что можно взять прямо сейчас
+-- Платежи которые нужно оплатить в этом месяце
+SELECT * FROM thing WHERE paid_until < time::now() + 30d
+  AND period != NONE;
+
+-- Вся цепочка обжалований по делу (рекурсивно)
+SELECT ->about->thing.* FROM thing:case_1 DEPTH 10;
+
+-- Открытые задачи для любого члена семьи
 SELECT * FROM thing WHERE status = "не начато"
   AND ->assigned_to->thing CONTAINS thing:family;
 
--- Мои задачи (назначены лично мне или семье)
+-- Мои задачи (личные + семейные, не выполненные)
 SELECT * FROM thing WHERE status != "выполнено"
   AND (->assigned_to->thing CONTAINS thing:dad
     OR ->assigned_to->thing CONTAINS thing:family);
 
--- Задачи которые разблокированы (все depends_on выполнены)
+-- Задачи без невыполненных зависимостей (можно начать)
 SELECT * FROM thing WHERE status = "не начато"
   AND ->depends_on->thing[WHERE status != "выполнено"] IS EMPTY;
 
--- Подзадачи родительской задачи
-SELECT <-part_of<-thing.* FROM thing:task_motorcycle_season;
+-- Все документы/решения по юридическому делу
+SELECT ->produces->thing.* FROM thing WHERE ->filed_with->thing != NONE;
 
--- Что нужно купить для задачи (чего не хватает)
-SELECT ->requires->thing.name AS item,
-       ->requires.quantity AS needed,
-       ->requires->thing.quantity AS have
-FROM thing:task_motorcycle_service
-WHERE ->requires->thing.quantity < ->requires.quantity;
-
--- Все просроченные задачи
-SELECT * FROM thing WHERE deadline < time::now()
-  AND status NOT IN ["выполнено", "отменено"];
-
--- Суммарный расход масла за все ТО
-SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
+-- Просроченные задачи и платежи
+SELECT * FROM thing
+  WHERE deadline < time::now() AND status NOT IN ["выполнено", "отменено"];
 ```
 
 ---
@@ -310,6 +300,10 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
       - дедлайн: дата
       - приоритет: текст      # низкий / средний / высокий
       - роль: текст           # папа / мама / сын / дочь / бабушка
+      - сумма: число          # для платежей
+      - период: текст         # ежемесячно / ежеквартально / ежегодно
+      - день_оплаты: число    # число месяца: 1–31
+      - оплачено_до: дата     # для периодических платежей
     дополнительные: любые
 
 связи:
@@ -319,27 +313,26 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
     поля:
       - reason: текст         # хранение / транспорт / ремонт / покупка
       - since: дата
-
   part_of:
     описание: часть чего / подзадача / запуск шаблона
     от: thing
     к: thing
-
   assigned_to:
-    описание: кто отвечает (человек, группа людей или вся семья)
+    описание: кто отвечает (человек, несколько людей или вся семья)
     от: thing
     к: thing
-
   depends_on:
     описание: задача ждёт выполнения другой
     от: thing
     к: thing
-
   about:
-    описание: задача касается этой вещи
+    описание: задача/обращение касается этой вещи или обжалует это решение
     от: thing
     к: thing
-
+  filed_with:
+    описание: обращение подано в эту инстанцию/организацию
+    от: thing
+    к: thing
   needs:
     описание: нужно купить
     от: thing
@@ -347,7 +340,6 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
     поля:
       - quantity: число
       - unit: текст
-
   requires:
     описание: плановый расход (шаблон → ингредиент/деталь)
     от: thing
@@ -355,12 +347,10 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
     поля:
       - quantity: число
       - unit: текст
-
   produces:
-    описание: результат выполнения
+    описание: результат выполнения (решение, документ, блюдо, изделие)
     от: thing
     к: thing
-
   used:
     описание: фактический расход при запуске
     от: thing
@@ -368,7 +358,6 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
     поля:
       - quantity: число
       - unit: текст
-
   related_to:
     описание: произвольная связь
     от: thing
@@ -386,3 +375,4 @@ SELECT math::sum(quantity) AS total FROM used WHERE out = thing:oil_10w40;
 - [ ] Уведомления — push или только в приложении?
 - [ ] Фотографии вещей?
 - [ ] Штрихкоды / QR-коды при добавлении?
+- [ ] Документы по юридическим делам — хранить файлы или только ссылки?
