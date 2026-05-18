@@ -3,15 +3,8 @@
 ## Концепция
 
 Всё есть **вещь** (`thing`). Гараж, полка, коробка, мотоцикл, двигатель, батарейка, машина,
-мастерская, магазин, список покупок — один тип узла.  
+мастерская, магазин, список покупок, рецепт, процедура обслуживания — один тип узла.  
 Смысл задаётся только рёбрами (связями) между вещами.
-
-Один узел может одновременно:
-- содержать другие вещи (быть контейнером)
-- находиться внутри чего-то
-- быть частью другой вещи
-- быть местом назначения (магазин, мастерская)
-- быть списком того, что нужно купить
 
 ---
 
@@ -19,7 +12,7 @@
 
 | Таблица | Описание |
 |---------|----------|
-| `thing` | Любая вещь: предмет, место, контейнер, транспорт, список, магазин |
+| `thing` | Любая вещь: предмет, место, контейнер, транспорт, список, магазин, рецепт, процедура, запуск |
 
 Поля у каждой вещи — произвольные. Никакой фиксированной схемы.
 
@@ -32,105 +25,123 @@
 | `contains` | Где физически находится вещь прямо сейчас | `reason`, `since` |
 | `part_of` | Частью чего является семантически | — |
 | `needs` | Что нужно купить (список → вещь) | `quantity`, `unit` |
+| `requires` | Что нужно для выполнения (шаблон → ингредиент/деталь) | `quantity`, `unit` |
+| `produces` | Что получается в результате (шаблон → результат) | — |
+| `used` | Что фактически потрачено при запуске | `quantity`, `unit` |
 | `related_to` | Произвольная связь с меткой | `label` |
 
 **`reason` на ребре `contains`:**
 - `хранение` — обычное место хранения
 - `транспорт` — вещь едет в машине
 - `ремонт` — вещь отдана в ремонт
-- `покупка` — вещь в процессе покупки (в магазине, в корзине)
+- `покупка` — вещь в процессе покупки
 
 ---
 
-## Сценарий: мотоцикл разобран, двигатель сдан в ремонт
+## Сценарий: рецепт и приготовление еды
+
+Рецепт описывает плановый расход. Каждое приготовление — отдельный запуск (`run`),
+который фиксирует фактический расход и уменьшает остатки.
 
 ```mermaid
 graph TD
-    Garage[Гараж]
-    Car[Машина]
-    RepairShop[Мастерская]
-    Shelf[Стеллаж]
-    ShelfA[Полка A]
-    Box[Коробка №3]
+    Recipe[Рецепт: Блины]
+    Run[Запуск: готовка 17 мая]
+    Pancakes[Блины]
+
+    Flour[Мука\nquantity: 200г]
+    Milk[Молоко\nquantity: 500мл]
+    Eggs[Яйца\nquantity: 3шт]
+
+    Recipe -->|requires qty:500г| Flour
+    Recipe -->|requires qty:2л| Milk
+    Recipe -->|requires qty:5шт| Eggs
+    Recipe -->|produces| Pancakes
+
+    Run -->|part_of| Recipe
+    Run -->|used qty:500г| Flour
+    Run -->|used qty:1.5л| Milk
+    Run -->|used qty:5шт| Eggs
+```
+
+`requires` — плановые нормы из рецепта  
+`used` — фактически потрачено (может отличаться)
+
+---
+
+## Сценарий: сборка электроники
+
+```mermaid
+graph TD
+    BOM[Схема: Контроллер полива]
+    Run[Сборка: 12 мая]
+    Board[Контроллер полива v1]
+
+    R1[Резисторы 10кОм\nquantity: 20шт]
+    C1[Конденсаторы 100мкФ\nquantity: 10шт]
+    Arduino[Arduino Nano\nquantity: 3шт]
+    PCB[Плата PCB\nquantity: 5шт]
+
+    BOM -->|requires qty:5шт| R1
+    BOM -->|requires qty:2шт| C1
+    BOM -->|requires qty:1шт| Arduino
+    BOM -->|requires qty:1шт| PCB
+    BOM -->|produces| Board
+
+    Run -->|part_of| BOM
+    Run -->|used qty:5шт| R1
+    Run -->|used qty:2шт| C1
+    Run -->|used qty:1шт| Arduino
+    Run -->|used qty:1шт| PCB
+```
+
+---
+
+## Сценарий: обслуживание техники
+
+```mermaid
+graph TD
+    Service[Регламент: ТО мотоцикла]
+    Run[ТО: апрель 2026]
     Motorcycle[Мотоцикл]
-    Engine[Двигатель]
-    Wheel[Колесо заднее]
 
-    Garage -->|contains| Motorcycle
-    Garage -->|contains| Shelf
-    Shelf -->|contains| ShelfA
-    ShelfA -->|contains| Box
-    Box -->|contains| Wheel
+    Oil[Масло 10W-40\nquantity: 2л]
+    OilFilter[Фильтр масляный\nquantity: 1шт]
+    AirFilter[Фильтр воздушный\nquantity: 0шт]
 
-    Car -->|contains, reason: транспорт| Engine
-    RepairShop -->|contains, reason: ремонт| Engine
+    Service -->|requires qty:4л| Oil
+    Service -->|requires qty:1шт| OilFilter
+    Service -->|requires qty:1шт| AirFilter
+    Service -->|produces| Motorcycle
 
-    Engine -->|part_of| Motorcycle
-    Wheel -->|part_of| Motorcycle
+    Run -->|part_of| Service
+    Run -->|used qty:4л| Oil
+    Run -->|used qty:1шт| OilFilter
 ```
+
+Воздушный фильтр не куплен → при запуске видно чего не хватает → добавляется в список покупок.
 
 ---
 
-## Сценарий: поход в магазин
+## Сценарий: от рецепта до магазина
 
 ```mermaid
-graph TD
-    Home[Дом]
-    Store[Магазин Лента]
-    List[Список покупок]
-    Car[Машина]
+graph LR
+    Recipe[Рецепт: Блины]
+    Inventory[Остатки дома]
+    ShoppingList[Список покупок]
+    Store[Магазин]
 
-    Milk[Молоко]
-    Bread[Хлеб]
-    Buckwheat[Гречка]
-
-    Store -->|contains| List
-    List -->|needs, qty: 2л| Milk
-    List -->|needs, qty: 1шт| Bread
-    List -->|needs, qty: 1кг| Buckwheat
+    Recipe -->|requires| Ingredients[Ингредиенты]
+    Inventory -->|quantity| Ingredients
+    Ingredients -->|чего не хватает| ShoppingList
+    ShoppingList -->|needs| Store
 ```
 
-Когда товар куплен:
-1. Вещь создаётся (или обновляется количество у существующей)
-2. Убирается ребро `needs` из списка
-3. Добавляется ребро `contains` от места хранения дома (холодильник, полка)
-
-```mermaid
-graph TD
-    Fridge[Холодильник]
-    Shelf[Полка на кухне]
-
-    Milk[Молоко ✓]
-    Bread[Хлеб ✓]
-    Buckwheat[Гречка ✓]
-
-    Fridge -->|contains| Milk
-    Shelf -->|contains| Bread
-    Shelf -->|contains| Buckwheat
-```
-
----
-
-## Сценарий: перевозка вещей на машине
-
-```mermaid
-graph TD
-    LocationA[Дача]
-    LocationB[Квартира]
-    Car[Машина]
-
-    Drill[Дрель]
-    Toolbox[Ящик с инструментами]
-
-    LocationA -->|contains| Toolbox
-    Toolbox -->|contains| Drill
-
-    Car -->|contains, reason: транспорт| Toolbox
-    LocationB -->|contains| Toolbox
-```
-
-В пути: `Ящик` и `Дрель` содержатся в `Машине`.  
-После приезда: `contains` меняется на `Квартира`.
+Логика генерации списка покупок:
+1. Берём `requires` рецепта/процедуры
+2. Сравниваем с текущим `quantity` в инвентаре
+3. Недостающее → `needs` в список покупок
 
 ---
 
@@ -138,13 +149,14 @@ graph TD
 
 ```mermaid
 graph LR
-    A[нужно купить] -->|needs в списке| B[куплено]
-    B -->|contains дома| C[хранится]
-    C -->|contains в машине, reason: транспорт| D[в пути]
-    D -->|contains в новом месте| C
-    C -->|contains в мастерской, reason: ремонт| E[в ремонте]
-    E -->|contains дома| C
-    C -->|удалено / выброшено| F[утилизировано]
+    A[нужно купить\nneeds в списке] -->|куплено| B[хранится\ncontains дома]
+    B -->|contains в машине\nreason: транспорт| C[в пути]
+    C -->|contains в новом месте| B
+    B -->|contains в мастерской\nreason: ремонт| D[в ремонте]
+    D -->|возвращено| B
+    B -->|used в запуске| E[израсходовано\nquantity уменьшилось]
+    B -->|part_of другой вещи| F[вошло в состав]
+    E -->|quantity = 0| G[закончилось\nneeds в списке]
 ```
 
 ---
@@ -155,18 +167,31 @@ graph LR
 -- Единственный тип узла
 DEFINE TABLE thing SCHEMALESS;
 
--- Физическое местонахождение (с причиной)
+-- Физическое местонахождение
 DEFINE TABLE contains TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD reason ON contains TYPE option<string>; -- хранение / транспорт / ремонт / покупка
 DEFINE FIELD since  ON contains TYPE option<datetime>;
 
--- Семантическая принадлежность
+-- Семантическая принадлежность (часть чего, запуск какого рецепта)
 DEFINE TABLE part_of TYPE RELATION FROM thing TO thing;
 
--- Список покупок: что нужно купить
+-- Список покупок
 DEFINE TABLE needs TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD quantity ON needs TYPE option<number>;
 DEFINE FIELD unit     ON needs TYPE option<string>;
+
+-- Плановый расход (рецепт/процедура → ингредиент/деталь)
+DEFINE TABLE requires TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD quantity ON requires TYPE option<number>;
+DEFINE FIELD unit     ON requires TYPE option<string>;
+
+-- Результат выполнения
+DEFINE TABLE produces TYPE RELATION FROM thing TO thing;
+
+-- Фактический расход при запуске
+DEFINE TABLE used TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD quantity ON used TYPE option<number>;
+DEFINE FIELD unit     ON used TYPE option<string>;
 
 -- Произвольная связь
 DEFINE TABLE related_to TYPE RELATION FROM thing TO thing SCHEMAFULL;
@@ -178,23 +203,32 @@ DEFINE FIELD label ON related_to TYPE string;
 ## SurrealQL: примеры запросов
 
 ```surql
--- Где сейчас двигатель (путь вверх)
-SELECT <-contains<-thing.* FROM thing:engine;
+-- Что нужно купить для рецепта (чего не хватает в инвентаре)
+SELECT
+    ->requires->thing.* AS ingredient,
+    ->requires.quantity AS needed,
+    ->requires->thing.quantity AS have
+FROM thing:pancake_recipe
+WHERE ->requires->thing.quantity < ->requires.quantity;
+
+-- История запусков рецепта
+SELECT <-part_of<-thing.* FROM thing:pancake_recipe;
+
+-- Суммарный расход ингредиента за все запуски
+SELECT math::sum(quantity) AS total FROM used
+WHERE out = thing:flour;
 
 -- Все вещи в ремонте
-SELECT ->contains->thing.* FROM thing:* WHERE ->contains.reason = "ремонт";
+SELECT ->contains->thing.* FROM thing WHERE ->contains[WHERE reason = "ремонт"];
 
 -- Что сейчас в машине
 SELECT ->contains->thing.* FROM thing:car;
 
--- Текущий список покупок
-SELECT ->needs->thing.* FROM thing:shopping_list_today;
+-- Все части мотоцикла и где они находятся
+LET $parts = SELECT <-part_of<-thing FROM thing:motorcycle;
+SELECT name, <-contains<-thing.name AS location FROM $parts;
 
--- Все части мотоцикла и где они находятся прямо сейчас
-LET $parts = SELECT <-part_of<-thing.* FROM thing:motorcycle;
-SELECT name, <-contains<-thing.name AS where FROM $parts;
-
--- Всё содержимое гаража рекурсивно (до 6 уровней)
+-- Всё содержимое гаража рекурсивно
 SELECT ->contains->(thing FETCH *) FROM thing:garage DEPTH 6;
 ```
 
@@ -210,12 +244,12 @@ SELECT ->contains->(thing FETCH *) FROM thing:garage DEPTH 6;
       - название: текст
     необязательные:
       - описание: текст
-      - количество: число
-      - единица: текст        # кг, шт, л, м
+      - количество: число       # текущий остаток
+      - единица: текст          # кг, шт, л, м
       - куплено: дата
       - цена: число
       - заметки: текст
-    дополнительные: любые     # без ограничений
+    дополнительные: любые
 
 связи:
   contains:
@@ -223,28 +257,49 @@ SELECT ->contains->(thing FETCH *) FROM thing:garage DEPTH 6;
     от: thing
     к: thing
     поля:
-      - reason: текст         # хранение / транспорт / ремонт / покупка
+      - reason: текст           # хранение / транспорт / ремонт / покупка
       - since: дата
 
   part_of:
-    описание: семантическая принадлежность (часть чего)
+    описание: семантическая принадлежность или запуск принадлежит шаблону
     от: thing
     к: thing
 
   needs:
-    описание: нужно купить (список покупок → вещь)
+    описание: нужно купить (список → вещь)
     от: thing
     к: thing
     поля:
       - quantity: число
-      - unit: текст           # кг, шт, л
+      - unit: текст
+
+  requires:
+    описание: плановый расход (шаблон → ингредиент/деталь)
+    от: thing
+    к: thing
+    поля:
+      - quantity: число
+      - unit: текст
+
+  produces:
+    описание: результат выполнения шаблона
+    от: thing
+    к: thing
+
+  used:
+    описание: фактический расход при конкретном запуске
+    от: thing  # запуск (run)
+    к: thing   # ингредиент/деталь
+    поля:
+      - quantity: число
+      - unit: текст
 
   related_to:
     описание: произвольная связь
     от: thing
     к: thing
     поля:
-      - label: текст          # "совместим", "комплект", "см. также"
+      - label: текст            # "совместим", "комплект", "см. также"
 ```
 
 ---
@@ -252,7 +307,7 @@ SELECT ->contains->(thing FETCH *) FROM thing:garage DEPTH 6;
 ## Открытые вопросы
 
 - [ ] История перемещений — хранить где вещь была раньше?
-- [ ] Учёт расхода — уменьшать количество (для еды, расходников)?
+- [ ] Расписание обслуживания — через сколько км / дней следующее ТО?
 - [ ] Фотографии вещей?
 - [ ] Штрихкоды / QR-коды при добавлении?
 - [ ] Несколько пользователей / ответственный за вещь?
