@@ -39,7 +39,7 @@
 | Связь | Описание | Поля на ребре |
 |-------|----------|---------------|
 | `contains` | Где физически находится вещь | `reason`, `since` |
-| `part_of` | Часть чего / подзадача / запуск шаблона | — |
+| `part_of` | Часть чего / подзадача / запуск шаблона / членство в группе | `until` |
 | `assigned_to` | Кто отвечает (человек, группа или вся семья) | — |
 | `depends_on` | Задача ждёт выполнения другой | — |
 | `about` | Задача/обращение касается этой вещи или решения | — |
@@ -48,12 +48,15 @@
 | `requires` | Плановый расход (шаблон → ингредиент/деталь) | `quantity`, `unit` |
 | `produces` | Результат выполнения (решение, документ, блюдо) | — |
 | `used` | Фактический расход при запуске | `quantity`, `unit` |
+| `participant` | Участник с ролью (организатор, посредник, информирован…) | `role` |
 | `promised_to` | Кому дано обещание | — |
 | `represents` | Цифровая копия → физический оригинал | — |
 | `can_access` | Кто имеет доступ к цифровой вещи | — |
 | `related_to` | Произвольная связь с меткой | `label` |
 
-**`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`
+**`reason` на ребре `contains`:** `хранение` / `транспорт` / `ремонт` / `покупка`  
+**`until` на ребре `part_of`:** дата окончания временного членства; если отсутствует — постоянно  
+**`role` на ребре `participant`:** `исполнитель` / `организатор` / `посредник` / `обещавший` / `информирован` / `свидетель`
 
 ---
 
@@ -159,6 +162,62 @@ graph TD
 **Шаблон доступа** — заранее созданный контейнер с типовым набором.  
 Пример: "Доступ врача" — контейнер с нужными цифровыми копиями,  
 врачу выдаётся `can_access` к этому контейнеру и ничего лишнего.
+
+---
+
+## Сценарий: роли участников и временные группы
+
+Врач — самостоятельная вещь со своими контактами. Постоянно `part_of` больница.
+Временное участие в задаче — через `participant` напрямую или через временную группу.
+
+```mermaid
+graph TD
+    Doctor[Врач Смирнов\nтел: +7-900-...\nспециализация: кардиолог]
+    Hospital[Городская больница №3]
+    Duty[Дежурный Петрова]
+    Friend[Товарищ Алексей]
+    Dad[Папа]
+
+    Promise[Обещание: записать на приём\ndeadline: 21 мая\nstatus: ожидается]
+    Task[Запись на приём к кардиологу\ndeadline: до 1 июля\nstatus: ожидает]
+
+    Doctor -->|part_of, постоянно| Hospital
+    Duty -->|part_of, постоянно| Hospital
+
+    Promise -->|assigned_to| Duty
+    Promise -->|promised_to| Dad
+    Promise -->|participant, role: посредник| Friend
+    Promise -->|produces| Task
+
+    Task -->|assigned_to| Doctor
+    Task -->|participant, role: посредник| Friend
+    Task -->|participant, role: информирован| Dad
+```
+
+**Постоянное vs временное членство через `part_of`:**
+
+| Ситуация | Ребро |
+|----------|-------|
+| Смирнов работает в больнице | `part_of` без `until` |
+| Смирнов в рабочей группе по делу | `part_of, until: 1 июня` |
+| Алексей помогает с юрделами | `participant, role: посредник` на конкретной задаче |
+
+**Временная группа** нужна только когда один набор людей участвует сразу в нескольких
+связанных задачах. Для одной задачи — проще `participant` напрямую.
+
+```surql
+-- Все задачи где участвует врач Смирнов (в любой роли)
+SELECT <-assigned_to<-thing.*, <-participant<-thing.*
+FROM thing:doctor_smirnov;
+
+-- Контакты всех участников задачи
+SELECT ->assigned_to->thing.name, ->assigned_to->thing.phone,
+       ->participant->thing.name, ->participant->thing.phone
+FROM thing:task_appointment;
+
+-- Временные членства которые скоро истекают
+SELECT * FROM part_of WHERE until < time::now() + 7d;
+```
 
 ---
 
@@ -463,7 +522,11 @@ DEFINE TABLE contains TYPE RELATION FROM thing TO thing SCHEMAFULL;
 DEFINE FIELD reason ON contains TYPE option<string>;
 DEFINE FIELD since  ON contains TYPE option<datetime>;
 
-DEFINE TABLE part_of    TYPE RELATION FROM thing TO thing;
+DEFINE TABLE part_of TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD until ON part_of TYPE option<datetime>;
+
+DEFINE TABLE participant TYPE RELATION FROM thing TO thing SCHEMAFULL;
+DEFINE FIELD role ON participant TYPE string;
 DEFINE TABLE assigned_to TYPE RELATION FROM thing TO thing;
 DEFINE TABLE depends_on  TYPE RELATION FROM thing TO thing;
 DEFINE TABLE about       TYPE RELATION FROM thing TO thing;
@@ -577,9 +640,11 @@ SELECT * FROM thing WHERE postponed_count > 2
       - reason: текст         # хранение / транспорт / ремонт / покупка
       - since: дата
   part_of:
-    описание: часть чего / подзадача / запуск шаблона
+    описание: часть чего / подзадача / запуск шаблона / членство в группе
     от: thing
     к: thing
+    поля:
+      - until: дата   # если указана — временное членство; если нет — постоянное
   assigned_to:
     описание: кто отвечает (человек, несколько людей или вся семья)
     от: thing
@@ -621,6 +686,13 @@ SELECT * FROM thing WHERE postponed_count > 2
     поля:
       - quantity: число
       - unit: текст
+  participant:
+    описание: участник с конкретной ролью (не основной ответственный)
+    от: thing   # задача, обещание, событие
+    к: thing    # человек или группа
+    поля:
+      - role: текст   # исполнитель / организатор / посредник / обещавший / информирован / свидетель
+
   promised_to:
     описание: кому дано обещание
     от: thing   # обещание
