@@ -7004,6 +7004,8 @@ ORDER BY generated_at DESC;
 | `litellm` | self-hosted прокси с учётом стоимости и маршрутизацией |
 | `groq` | быстрый inference |
 | `mistral` | Mistral AI |
+| `vision-local` | локальная vision-модель через Ollama (llava, minicpm-v, qwen2-vl) |
+| `vision-api` | облачная vision-модель (GPT-4o, Claude 3.5 Sonnet, Gemini Flash) |
 
 **Позднее связывание провайдера** — ключевой паттерн. Когда ещё не определился с провайдером, указываешь на прокси или LM Studio. Чаты ссылаются на этот datasource-узел. Когда определился — меняешь один узел, все чаты переключаются автоматически.
 
@@ -7701,17 +7703,144 @@ kind: шлюз  (subtype: voice-local)
   device: thing:device_kitchen_speaker
 ```
 
-STT и TTS — `kind: источник-данных`:
+STT, TTS и Vision — `kind: источник-данных`:
 
 | subtype | сервис |
 |---------|--------|
-| `whisper-local` | OpenAI Whisper локально |
+| `whisper-local` | OpenAI Whisper локально (faster-whisper) |
 | `whisper-api` | OpenAI Whisper API |
 | `google-stt` | Google Speech-to-Text |
 | `yandex-stt` | Яндекс SpeechKit STT |
 | `yandex-tts` | Яндекс SpeechKit TTS |
 | `edge-tts` | Microsoft Edge TTS (бесплатный) |
 | `piper` | Piper TTS локально |
+| `vision-local` | Ollama: llava, minicpm-v, qwen2-vl — локально на GPU |
+| `vision-api` | GPT-4o, Claude 3.5 Sonnet, Gemini Flash — облако |
+
+### Vision: распознавание изображений
+
+Vision-модель — такой же `kind: источник-данных`, шаг плейбука отправляет ей изображение
+и получает структурированный ответ.
+
+```yaml
+# Локальная vision-модель на RTX 3090
+kind: источник-данных
+name: "Qwen2-VL local"
+subtype: vision-local
+endpoint: "http://gpu-server.home:11434"
+model: "qwen2-vl:7b"
+role: vision
+
+# Облачная — для сложных случаев
+kind: источник-данных
+name: "GPT-4o vision"
+subtype: vision-api
+endpoint: "https://api.openai.com/v1"
+model: "gpt-4o"
+role: vision
+fallback_to: thing:ds_vision_local
+```
+
+### Сценарий: фото одометра → показание → триггер ТО
+
+Пользователь отправляет фото в Telegram-бот или голосовой интерфейс.
+Плейбук из четырёх шагов обрабатывает его полностью автономно:
+
+```mermaid
+graph TD
+    Photo["Фото одометра\n(Telegram / камера)"]
+    S1["Шаг 1: Vision\nизвлечь число"]
+    S2["Шаг 2: Resolve\nопределить транспорт"]
+    S3["Шаг 3: Update\nобновить показание"]
+    S4["Шаг 4: Check\nпроверить счётчики"]
+    Bot["Бот: «Записал: 53 420 км\nДо ТО осталось 580 км»"]
+    TO["CREATE run\n«ТО — сезонное»"]
+
+    Photo --> S1
+    S1 --> S2
+    S2 -->|один транспорт| S3
+    S2 -->|несколько| Bot2["Бот уточняет:\n«Это BMW или Lada?»"]
+    Bot2 --> S3
+    S3 --> S4
+    S4 -->|порог превышен| TO
+    S4 --> Bot
+```
+
+**Шаг 1 — Vision:** извлечь показание из фото
+
+```yaml
+kind: шаг
+name: "Распознать одометр"
+order: 1
+assigned_to: thing:ds_vision_local
+prompt: |
+  На фото — приборная панель автомобиля или мотоцикла.
+  Найди показание одометра (пробег в км или милях).
+  Верни JSON: {"value": <число>, "unit": "km"|"mi", "confidence": 0..1}
+  Если не можешь определить однозначно — {"value": null, "error": "причина"}
+input_image: $trigger.attachment     # фото из сообщения
+output_field: odometer_reading       # результат для следующих шагов
+on_error: ask_user                   # если null — попросить переснять
+```
+
+**Шаг 2 — Resolve:** определить транспортное средство
+
+```yaml
+kind: шаг
+name: "Определить транспорт"
+order: 2
+depends_on: thing:step_vision
+on_success: |
+  -- Транспорт пользователя с одометром
+  SELECT id, name, odometer_km, odometer_mi
+  FROM thing
+  WHERE kind IN ["транспорт", "мотоцикл"]
+    AND ->can_access<-thing = $auth.user
+```
+
+Если найден один — автоматически выбирается. Если несколько — бот спрашивает:
+
+```
+«Для какого транспорта записать 53 420 км?
+  1. BMW R1250GS (последнее: 43 200 км)
+  2. Lada Vesta (последнее: 87 450 км)»
+```
+
+**Шаг 3 — Update:** записать показание
+
+```surql
+UPDATE $resolved_vehicle SET
+  odometer_km    = $steps.odometer_reading.value,
+  odometer_at    = time::now(),
+  odometer_by    = $auth.user;
+
+-- Сохранить историческую запись
+CREATE thing SET
+  kind           = "показание",
+  value          = $steps.odometer_reading.value,
+  unit           = $steps.odometer_reading.unit,
+  recorded_at    = time::now(),
+  source         = "фото",
+  confidence     = $steps.odometer_reading.confidence,
+  ->about->       $resolved_vehicle,
+  ->represents->  $trigger.attachment;   -- фото как доказательство
+```
+
+**Шаг 4 — Check:** проверить counter-based шаблоны
+
+```surql
+-- Найти шаблоны задач привязанные к этому транспорту
+SELECT id, name, trigger_threshold, last_trigger_value
+FROM thing
+WHERE template = true
+  AND period   = "счётчик"
+  AND trigger_source = $resolved_vehicle
+  AND ($steps.odometer_reading.value - last_trigger_value) >= trigger_threshold;
+```
+
+Для каждого сработавшего шаблона — создаётся `run`, пользователь получает уведомление.
+
+**Итог:** одно фото → распознавание → уточнение если нужно → запись показания с фото-доказательством → автоматическое создание задач ТО. Всё в графе, без внешних сервисов.
 
 Голосовой запрос сохраняется в `kind: сообщение` как текст (транскрипт) с вложением аудио:
 
