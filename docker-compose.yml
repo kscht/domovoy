@@ -9,7 +9,7 @@ services:
     volumes:
       - surrealdb_data:/data
     ports:
-      - "${SURREAL_PORT:-8000}:8000"
+      - "${LOCAL_IP:-127.1.0.1}:${SURREAL_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
       interval: 5s
@@ -27,8 +27,8 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${LOCAL_IP:-127.1.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${LOCAL_IP:-127.1.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -60,7 +60,7 @@ services:
       - /app/node_modules
       - /app/.next
     ports:
-      - "${WEB_PORT:-3000}:3000"
+      - "${LOCAL_IP:-127.1.0.1}:${WEB_PORT:-3000}:3000"
     env_file: .env
     environment:
       SURREAL_URL: ws://surrealdb:8000/rpc
@@ -183,7 +183,7 @@ services:
         SURREALIST_VERSION: ${SURREALIST_VERSION:-surrealist-v3.8.5}
     restart: unless-stopped
     ports:
-      - "${SURREALIST_PORT:-8080}:8080"
+      - "${LOCAL_IP:-127.1.0.1}:${SURREALIST_PORT:-8080}:8080"
     volumes:
       - ./docker/surrealist/instance.json:/usr/share/nginx/html/instance.json:ro
     profiles:
