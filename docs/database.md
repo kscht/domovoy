@@ -621,6 +621,146 @@ graph TD
 
 На одну задачу — сколько угодно напоминаний, каждому своё (`assigned_to`), в любое время.
 
+### Поля шаблона периодической задачи
+
+```yaml
+kind: задача
+template: true                        # это шаблон, не конкретный экземпляр
+period: еженедельно                   # ежедневно | еженедельно | ежемесячно | ежеквартально | ежегодно | счётчик
+schedule: "каждую пятницу"            # человекочитаемое описание
+cron: "0 9 * * FRI"                  # машиночитаемое для time-based расписаний
+trigger_field: ~                      # для счётчиков: "odometer_km"
+trigger_threshold: ~                  # для счётчиков: 10000
+trigger_source: thing:moto_bmw        # узел, у которого читается поле
+next_run_at: "2026-05-23T09:00:00Z"  # когда создать следующий run (планировщик читает это поле)
+last_run_at: "2026-05-16T09:00:00Z"  # когда был последний run
+enabled: true
+```
+
+Два типа расписания — **time-based** (cron) и **counter-based** (счётчик/показание):
+
+| Тип | Поля | Пример |
+|-----|------|--------|
+| Time-based | `cron`, `next_run_at` | «каждую пятницу», «1-е число месяца» |
+| Counter-based | `trigger_field`, `trigger_threshold`, `trigger_source` | «каждые 10 000 км» |
+
+### Планировщик: как создаётся следующий run
+
+Воркер-планировщик (`kind: воркер`, subtype: `scheduler`) просыпается каждую минуту
+и делает один атомарный запрос:
+
+```surql
+-- Найти все шаблоны, у которых next_run_at наступило
+SELECT id, cron, period, assigned_to, name, trigger_field, trigger_source, trigger_threshold
+FROM thing
+WHERE template = true
+  AND enabled  = true
+  AND period  != "счётчик"
+  AND next_run_at <= time::now();
+```
+
+Для каждого найденного шаблона воркер:
+
+1. Создаёт `run` — новый экземпляр задачи:
+
+```surql
+CREATE thing SET
+  kind       = "задача",
+  name       = string::concat($template.name, " — ", time::format(time::now(), "%d.%m.%Y")),
+  status     = "не начато",
+  template   = false,
+  deadline   = <следующий срок по cron>,
+  created_at = time::now();
+
+RELATE $new_run->part_of->$template_id;
+
+-- скопировать assigned_to если есть
+IF $template.assigned_to != NONE {
+  RELATE $new_run->assigned_to->$template.assigned_to;
+};
+```
+
+2. Обновляет `next_run_at` на следующее срабатывание:
+
+```surql
+UPDATE $template_id SET
+  last_run_at = time::now(),
+  next_run_at = <вычислить по cron>;
+```
+
+Вычисление следующего `next_run_at` — стандартная cron-библиотека на стороне воркера
+(например, `croner` для Node.js или `croniter` для Python).
+
+### Counter-based расписание (пробег, показания счётчика)
+
+Для «каждые 10 000 км» триггер — не время, а значение поля у другого узла:
+
+```yaml
+# шаблон ТО мотоцикла
+kind: задача
+template: true
+period: счётчик
+trigger_source: thing:moto_bmw      # у этого узла читаем поле
+trigger_field: odometer_km          # какое поле
+trigger_threshold: 10000            # порог изменения
+last_trigger_value: 43200           # значение при последнем создании run
+enabled: true
+```
+
+Планировщик для counter-based шаблонов:
+
+```surql
+-- Найти счётчики, у которых текущее значение превысило порог
+SELECT
+  t.id AS template_id,
+  t.trigger_field,
+  t.trigger_threshold,
+  t.last_trigger_value,
+  s.*[t.trigger_field] AS current_value
+FROM thing AS t, thing AS s
+WHERE t.template = true
+  AND t.enabled  = true
+  AND t.period   = "счётчик"
+  AND t.trigger_source = s.id
+  AND (s.*[t.trigger_field] - t.last_trigger_value) >= t.trigger_threshold;
+```
+
+При срабатывании — создаётся `run` и обновляется `last_trigger_value`:
+
+```surql
+UPDATE $template_id SET last_trigger_value = $current_value;
+```
+
+### Диаграмма: жизненный цикл периодической задачи
+
+```mermaid
+graph TD
+    Tmpl["Шаблон\nperiod: еженедельно\ncron: 0 9 * * FRI\nnext_run_at: 23 мая 09:00"]
+    Sched["Планировщик\n(воркер, каждую минуту)"]
+    Run1["Run: 16 мая\nstatus: выполнено"]
+    Run2["Run: 23 мая\nstatus: не начато"]
+    Rem["Напоминание\n22 мая 09:00"]
+
+    Sched -->|next_run_at наступило| Tmpl
+    Sched -->|CREATE| Run2
+    Sched -->|UPDATE next_run_at → 30 мая| Tmpl
+    Run1 -->|part_of| Tmpl
+    Run2 -->|part_of| Tmpl
+    Rem  -->|about| Run2
+```
+
+### Пропущенные запуски
+
+Если планировщик был офлайн и пропустил несколько срабатываний —
+создаётся только **один** `run` (последний), а не все пропущенные.
+Поле `missed_runs_count` на шаблоне фиксирует количество пропусков для аудита:
+
+```surql
+UPDATE $template_id SET
+  missed_runs_count = missed_runs_count + $skipped,
+  next_run_at       = <ближайшее будущее срабатывание по cron>;
+```
+
 ---
 
 ## Перенос, пауза, история
@@ -9508,5 +9648,5 @@ graph TD
 ## Открытые вопросы
 
 - [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
-- [ ] Повторяющиеся задачи — шаблон с расписанием (каждую субботу, каждые 10000 км)?
+- [x] Повторяющиеся задачи — шаблон с расписанием (каждую субботу, каждые 10000 км)? → `template: true` + `cron` / `trigger_field`; планировщик-воркер создаёт `run` через `part_of`
 - [x] Уведомления — push или только в приложении? → шлюз `kind: push` + другие каналы
