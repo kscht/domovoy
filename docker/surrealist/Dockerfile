@@ -15,8 +15,9 @@ WORKDIR /app
 
 RUN bun install --frozen-lockfile
 
-# Surrealist использует Vite — стандартный build даёт web-сборку в dist/
-RUN bun run build 2>/dev/null || bun run build:web
+# VITE_SURREALIST_DOCKER=true активирует DockerAdapter вместо BrowserAdapter,
+# который иначе редиректит на surrealdb.com/surrealist
+RUN VITE_SURREALIST_DOCKER=true bun run build
 
 # ── Stage 2: serve ────────────────────────────────────────────────────────────
 FROM nginx:1.27-alpine
