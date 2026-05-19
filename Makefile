@@ -44,8 +44,13 @@ workers:
 	$(COMPOSE) up -d worker-scheduler worker-playbook worker-bot worker-ai worker-files
 
 ## Surrealist GUI (self-hosted, собирается из исходников ~3 мин при первом запуске)
-## Доступен на http://localhost:$(SURREALIST_PORT:-8080)
+## Доступен на http://localhost:${SURREALIST_PORT:-8080}
 surrealist:
+	$(COMPOSE) --profile tools up -d surrealist
+
+## Пересобрать Surrealist (новая версия: make surrealist-update SURREALIST_VERSION=surrealist-v3.9.0)
+surrealist-update:
+	$(COMPOSE) --profile tools build --no-cache surrealist
 	$(COMPOSE) --profile tools up -d surrealist
 
 # ── База данных ───────────────────────────────────────────────────────────────

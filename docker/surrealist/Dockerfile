@@ -1,7 +1,7 @@
 ARG SURREALIST_VERSION=surrealist-v3.8.5
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM node:22-alpine AS builder
+FROM oven/bun:1-alpine AS builder
 
 ARG SURREALIST_VERSION
 
@@ -13,10 +13,10 @@ RUN git clone --depth 1 \
 
 WORKDIR /app
 
-RUN npm ci
+RUN bun install --frozen-lockfile
 
 # Surrealist использует Vite — стандартный build даёт web-сборку в dist/
-RUN npm run build 2>/dev/null || npm run build:web
+RUN bun run build 2>/dev/null || bun run build:web
 
 # ── Stage 2: serve ────────────────────────────────────────────────────────────
 FROM nginx:1.27-alpine
