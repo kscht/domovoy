@@ -47,6 +47,8 @@ domovoy/
 ├── docker-compose.test.yml  — тесты (SurrealDB memory + MinIO tmpfs)
 ├── Makefile                 — make up/down/test/deploy/seed/shell-db
 ├── .env / .env.example
+├── docker/
+│   └── surrealist/          — кастомный build Surrealist GUI (nginx)
 ├── web/                     — Next.js (ещё не инициализирован)
 ├── worker-scheduler/        — TS: cron + counter-триггеры
 ├── worker-playbook/         — TS: DAG-исполнение плейбуков, HTTP-интеграции
@@ -54,7 +56,10 @@ domovoy/
 ├── worker-ai/               — Python: embeddings, reranker, Whisper, vision
 ├── worker-files/            — Python: chunking, OCR, thumbnails
 ├── scripts/
-│   └── seed.surql           — тестовый датасет (ещё не написан)
+│   ├── seed.surql              — тестовый датасет (2161 оператор, все 25 рёбер)
+│   ├── generate_seed.py        — генератор основного датасета
+│   ├── generate_forum_seed.py  — wiki/чаты из forum30.jsonl
+│   └── import_fixtures.py      — загрузка медиафайлов в MinIO
 └── docs/
     ├── database.md          — полная схема (~9500 строк)
     └── comparison.md        — сравнение с конкурентами
@@ -65,28 +70,37 @@ domovoy/
 - [x] Полная схема данных в `docs/database.md`
 - [x] Docker Compose: dev + prod + test
 - [x] Makefile с командами
-- [ ] `scripts/seed.surql` — тестовый датасет
+- [x] `scripts/seed.surql` — 2161 оператор, все 25 типов рёбер
+- [x] Surrealist GUI контейнер (`docker/surrealist/`, profile: tools) — см. проблему ниже
 - [ ] `web/` — инициализировать Next.js проект
 - [ ] `worker-scheduler/` — минимальный воркер
 - [ ] DEFINE-схема в SurrealDB (из database.md выжать в .surql файл)
 - [ ] UI-спайки (спайк A: thing list + detail, спайк B: граф-визуализация)
+- [ ] Залить медиафикстуры (`python3 scripts/import_fixtures.py`)
 
-## Тестовый датасет (запланирован)
+## Тестовый датасет
 
-~20 узлов: 3 человека (Папа/Мама/Сын), 2 места (Квартира/Гараж), мотоцикл BMW с одометром, ноутбук одолженный сыну, 4 задачи разных статусов с зависимостями, шаблон ТО (counter-based), шаблон платежа (cron), документ ОСАГО, сервер Proxmox.
+`scripts/seed.surql` — готов. Залить: `make seed`.
+
+Медиафикстуры (пока не залиты):
+- Источник изображений: `~/cursor/yascrap/yaplakal-scraper/data/*.jpg`
+- Источник видео: `~/shorts/*.mp4`
+- Команда: `python3 scripts/import_fixtures.py` (или `--dry-run`)
 
 ## Команды
 
 ```bash
-make infra          # поднять только SurrealDB + MinIO (для локальной разработки)
-make up             # поднять всё
-make test           # все тесты (TS + Python)
-make test-ts        # только TS тесты
-make test-e2e       # Playwright E2E
-make test-py        # все Python тесты
-make shell-db       # SurrealQL REPL
-make seed           # залить тестовый датасет
-make deploy         # деплой на home-server через SSH
+make infra              # поднять только SurrealDB + MinIO (для локальной разработки)
+make up                 # поднять всё
+make surrealist         # генерирует instance.json из .env, поднимает Surrealist :8080
+make surrealist-update  # pull новой версии + restart
+make test               # все тесты (TS + Python)
+make test-ts            # только TS тесты
+make test-e2e           # Playwright E2E
+make test-py            # все Python тесты
+make shell-db           # SurrealQL REPL
+make seed               # залить тестовый датасет
+make deploy             # деплой на home-server через SSH
 ```
 
 ## Важные детали
@@ -96,3 +110,13 @@ make deploy         # деплой на home-server через SSH
 - GPU-сервер (Ollama) внешний, в docker-compose не входит, адрес в `OLLAMA_ENDPOINT`
 - Если нужен Go-воркер для конкретного `subtype` — добавить новый сервис в compose, тот же паттерн захвата задачи
 - Граф-визуализация в UI — библиотека ещё не выбрана (кандидат: React Flow)
+- SurrealQL: все IDs в бэктиках `` `id` ``, строки в одинарных `'...'`, `time::now()` без кавычек
+- SurrealDB v2 API: `POST /sql` с заголовками `surreal-ns` / `surreal-db`
+
+## Surrealist GUI (нерешённая проблема)
+
+Контейнер поднимается (`make surrealist` → http://localhost:8080), но Surrealist показывает "Create connections" вместо pre-configured подключения из `instance.json`.
+
+**Причина:** официальный образ `surrealdb/surrealist` собран без `VITE_SURREALIST_DOCKER=true`, поэтому DockerAdapter не активируется и `/instance.json` не читается. Наш кастомный build из исходников (`docker/surrealist/Dockerfile`) собирается с этим флагом, но при проверке бандла `"/instance.json"` встречается только в changelog, не в runtime-fetch.
+
+**Следующий шаг:** открыть http://localhost:8080 → DevTools → Network tab — проверить, есть ли запрос к `instance.json`. Если нет — пересобрать `--no-cache` и проверить наличие строки `"/instance.json"` в js-бандле.
