@@ -13,3 +13,4 @@ test-results/*
 backups/*
 !backups/.gitkeep
 docker/surrealist/instance.json
+cursor.md
