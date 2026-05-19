@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: up down restart build logs ps infra web workers \
+.PHONY: up down restart build logs ps infra web workers surrealist \
         db-init seed shell-db shell-minio \
         backup restore clean-start \
         test test-ts test-e2e test-py test-py-ai test-py-files test-clean \
@@ -42,6 +42,11 @@ web:
 
 workers:
 	$(COMPOSE) up -d worker-scheduler worker-playbook worker-bot worker-ai worker-files
+
+## Surrealist GUI (self-hosted, собирается из исходников ~3 мин при первом запуске)
+## Доступен на http://localhost:$(SURREALIST_PORT:-8080)
+surrealist:
+	$(COMPOSE) --profile tools up -d surrealist
 
 # ── База данных ───────────────────────────────────────────────────────────────
 

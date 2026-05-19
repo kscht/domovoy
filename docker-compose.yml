@@ -175,6 +175,18 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  # ── Surrealist GUI (self-hosted) ────────────────────────────────────────────
+  surrealist:
+    build:
+      context: ./docker/surrealist
+      args:
+        SURREALIST_VERSION: ${SURREALIST_VERSION:-surrealist-v3.8.5}
+    restart: unless-stopped
+    ports:
+      - "${SURREALIST_PORT:-8080}:8080"
+    profiles:
+      - tools
+
 volumes:
   surrealdb_data:
   minio_data:
