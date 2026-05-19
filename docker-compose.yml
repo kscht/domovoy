@@ -1,0 +1,181 @@
+services:
+
+  # ── Database ────────────────────────────────────────────────────────────────
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    restart: unless-stopped
+    command: start --log info --user ${SURREAL_USER} --pass ${SURREAL_PASS} rocksdb:/data/domovoy
+    volumes:
+      - surrealdb_data:/data
+    ports:
+      - "${SURREAL_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Object storage ──────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASS}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_USER} ${MINIO_PASS} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET}-public &&
+        mc anonymous set public local/${MINIO_BUCKET}-public &&
+        echo 'MinIO ready'
+      "
+
+  # ── Web (Next.js) ───────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000/rpc
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # ── Worker: scheduler (TypeScript) ─────────────────────────────────────────
+  # Периодические задачи, cron, counter-триггеры
+  worker-scheduler:
+    build:
+      context: ./worker-scheduler
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./worker-scheduler:/app
+      - /app/node_modules
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      WORKER_ID: scheduler-1
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  # ── Worker: playbook runner (TypeScript) ────────────────────────────────────
+  # Исполнение плейбуков, HTTP-интеграции, шаги DAG
+  worker-playbook:
+    build:
+      context: ./worker-playbook
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./worker-playbook:/app
+      - /app/node_modules
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      WORKER_ID: playbook-1
+      MINIO_ENDPOINT: minio:9000
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  # ── Worker: bot / voice gateway (TypeScript) ────────────────────────────────
+  # Telegram-бот, голосовой шлюз, tool use
+  worker-bot:
+    build:
+      context: ./worker-bot
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./worker-bot:/app
+      - /app/node_modules
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      WORKER_ID: bot-1
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  # ── Worker: AI (Python) ─────────────────────────────────────────────────────
+  # Embeddings (BGE-M3), reranker (BGE-Reranker), Whisper STT, vision pipeline
+  worker-ai:
+    build:
+      context: ./worker-ai
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./worker-ai:/app
+      - ai_models:/models        # кэш скачанных моделей
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000
+      WORKER_ID: ai-1
+      OLLAMA_ENDPOINT: ${OLLAMA_ENDPOINT:-http://host.docker.internal:11434}
+      MODELS_DIR: /models
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    # GPU проброс (раскомментировать если Ollama не на внешнем сервере)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── Worker: file processor (Python) ─────────────────────────────────────────
+  # Chunking PDF/DOCX/MD, OCR, thumbnail generation, metadata extraction
+  worker-files:
+    build:
+      context: ./worker-files
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    volumes:
+      - ./worker-files:/app
+      - file_tmp:/tmp/domovoy    # временные файлы при обработке
+    env_file: .env
+    environment:
+      SURREAL_URL: ws://surrealdb:8000
+      WORKER_ID: files-1
+      MINIO_ENDPOINT: minio:9000
+      TMP_DIR: /tmp/domovoy
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+volumes:
+  surrealdb_data:
+  minio_data:
+  ai_models:
+  file_tmp:

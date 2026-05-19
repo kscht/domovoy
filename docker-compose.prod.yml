@@ -1,0 +1,86 @@
+services:
+
+  surrealdb:
+    restart: always
+    command: start --log warn --user ${SURREAL_USER} --pass ${SURREAL_PASS} rocksdb:/data/domovoy
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  minio:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    restart: always
+    volumes: []    # в prod нет bind mount исходников
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512m
+
+  worker-scheduler:
+    build:
+      context: ./worker-scheduler
+      dockerfile: Dockerfile
+    restart: always
+    volumes: []
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  worker-playbook:
+    build:
+      context: ./worker-playbook
+      dockerfile: Dockerfile
+    restart: always
+    volumes: []
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512m
+
+  worker-bot:
+    build:
+      context: ./worker-bot
+      dockerfile: Dockerfile
+    restart: always
+    volumes: []
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  worker-ai:
+    build:
+      context: ./worker-ai
+      dockerfile: Dockerfile
+    restart: always
+    volumes:
+      - ai_models:/models
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  worker-files:
+    build:
+      context: ./worker-files
+      dockerfile: Dockerfile
+    restart: always
+    volumes:
+      - file_tmp:/tmp/domovoy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
