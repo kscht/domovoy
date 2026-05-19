@@ -1,0 +1,21 @@
+{
+	"telemetry": false,
+	"cloud": {
+		"enabled": false
+	},
+	"connections": [
+		{
+			"id": "domovoy-local",
+			"name": "Домовой (local)",
+			"authentication": {
+				"protocol": "${SURREAL_PROTOCOL}",
+				"hostname": "${SURREAL_HOST}:${SURREAL_PORT}",
+				"mode": "root",
+				"username": "${SURREAL_USER}",
+				"password": "${SURREAL_PASS}"
+			},
+			"defaultNamespace": "${SURREAL_NS}",
+			"defaultDatabase": "${SURREAL_DB}"
+		}
+	]
+}

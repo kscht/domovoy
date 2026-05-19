@@ -43,14 +43,24 @@ web:
 workers:
 	$(COMPOSE) up -d worker-scheduler worker-playbook worker-bot worker-ai worker-files
 
-## Surrealist GUI (self-hosted, собирается из исходников ~3 мин при первом запуске)
+## Surrealist GUI — рендерит instance.json из .env и поднимает контейнер
 ## Доступен на http://localhost:${SURREALIST_PORT:-8080}
-surrealist:
+surrealist: docker/surrealist/instance.json
 	$(COMPOSE) --profile tools up -d surrealist
 
-## Пересобрать Surrealist (новая версия: make surrealist-update SURREALIST_VERSION=surrealist-v3.9.0)
-surrealist-update:
-	$(COMPOSE) --profile tools build --no-cache surrealist
+docker/surrealist/instance.json: docker/surrealist/instance.json.tmpl .env
+	SURREAL_PROTOCOL=ws \
+	SURREAL_HOST=$${SURREAL_HOST:-localhost} \
+	SURREAL_PORT=$${SURREAL_PORT:-8000} \
+	SURREAL_USER=$${SURREAL_USER:-root} \
+	SURREAL_PASS=$${SURREAL_PASS} \
+	SURREAL_NS=$${SURREAL_NS:-domovoy} \
+	SURREAL_DB=$${SURREAL_DB:-domovoy} \
+	envsubst < docker/surrealist/instance.json.tmpl > docker/surrealist/instance.json
+
+## Обновить Surrealist (новая версия: make surrealist-update SURREALIST_VERSION=3.9.0)
+surrealist-update: docker/surrealist/instance.json
+	$(COMPOSE) --profile tools pull surrealist
 	$(COMPOSE) --profile tools up -d surrealist
 
 # ── База данных ───────────────────────────────────────────────────────────────
