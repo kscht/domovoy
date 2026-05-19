@@ -9286,6 +9286,225 @@ ORDER BY kind, order;
 
 ---
 
+## Локальный GPU-стек и векторизация
+
+Домовой рассчитан на self-hosted деплой с локальным GPU. Сервер с RTX 3090 (24 GB VRAM)
+закрывает все AI-задачи без внешних API: LLM-инференс, embeddings, reranking, STT.
+
+### Рекомендуемый стек
+
+| Задача | Модель | VRAM | Инструмент |
+|--------|--------|------|-----------|
+| LLM (основной) | Qwen2.5 32B Q4_K_M | ~20 GB | Ollama |
+| или | Gemma 3 27B Q4 | ~18 GB | Ollama |
+| Embeddings | BGE-M3 | ~0.6 GB | Ollama / FlagEmbedding |
+| Reranker | BGE-Reranker-v2-m3 | ~0.6 GB | FlagEmbedding |
+| STT | Whisper large-v3 | ~3 GB | faster-whisper |
+
+Одновременный стек: **Qwen2.5 32B + BGE-M3 + Reranker ≈ 21 GB** — помещается.
+Whisper грузится по требованию (голосовой ввод нечастый).
+
+**Почему BGE-M3:** мультиязычная модель (100+ языков), хорошо работает с русским.
+Поддерживает dense + sparse + colbert — три поисковых сигнала из одной модели.
+`nomic-embed-text` — английский first, для русских текстов заметно хуже.
+
+### Источники данных для локального GPU
+
+```yaml
+# LLM
+kind: источник-данных
+name: "Ollama — Qwen2.5 32B"
+subtype: ollama
+endpoint: "http://gpu-server.home:11434"
+model: "qwen2.5:32b-instruct-q4_K_M"
+is_default: true
+context_window: 32768
+
+# Embeddings
+kind: источник-данных
+name: "BGE-M3 local"
+subtype: ollama
+endpoint: "http://gpu-server.home:11434"
+model: "bge-m3"
+role: embedding
+dimension: 1024
+
+# Reranker (отдельный HTTP-сервис на FlagEmbedding)
+kind: источник-данных
+name: "BGE-Reranker-v2-m3"
+subtype: http
+endpoint: "http://gpu-server.home:8001/rerank"
+role: reranker
+
+# STT
+kind: источник-данных
+name: "Whisper large-v3"
+subtype: whisper
+endpoint: "http://gpu-server.home:9000"
+language: auto
+```
+
+Переключение на OpenAI — смена одного узла `kind: источник-данных`. Остальная система не меняется.
+
+### MTREE-индекс под BGE-M3
+
+BGE-M3 возвращает 1024-мерные векторы. Индекс объявляется под конкретную размерность:
+
+```surql
+-- BGE-M3 (рекомендуется, multilingual)
+DEFINE INDEX idx_embedding ON thing FIELDS embedding MTREE DIMENSION 1024;
+
+-- OpenAI text-embedding-3-small / ada-002
+-- DEFINE INDEX idx_embedding ON thing FIELDS embedding MTREE DIMENSION 1536;
+
+-- nomic-embed-text / all-MiniLM (лёгкий вариант)
+-- DEFINE INDEX idx_embedding ON thing FIELDS embedding MTREE DIMENSION 768;
+```
+
+### Что векторизуется
+
+Embedding вычисляется не только для файловых чанков, но и для любого узла с текстом:
+
+| kind | поля для embedding |
+|------|--------------------|
+| `чанк` | `text` |
+| `блок` | `text` |
+| `задача` | `name + description + notes` |
+| `сообщение` | `text` |
+| `инцидент` | `name + description + resolution` |
+| `курс`, `урок` | `name + content` |
+| `документ` | `name + description` |
+
+Поле `embedding_status` отслеживает актуальность вектора:
+
+```surql
+DEFINE FIELD embedding        ON thing TYPE option<array<float>>;
+DEFINE FIELD embedding_status ON thing TYPE option<string>;
+-- значения: "актуален" | "нужно-обновить" | "отсутствует"
+DEFINE FIELD embedding_model  ON thing TYPE option<string>;
+-- фиксируем какой моделью считали (при смене модели → ре-векторизация)
+```
+
+### DEFINE EVENT: ре-векторизация при изменении текста
+
+```surql
+DEFINE EVENT embed_on_change ON TABLE thing
+  WHEN $event IN ["CREATE", "UPDATE"]
+    AND $after.kind IN [
+      "блок", "задача", "сообщение", "инцидент",
+      "курс", "урок", "документ", "чанк"
+    ]
+    AND (
+      $after.text        != $before.text        OR
+      $after.description != $before.description OR
+      $after.notes       != $before.notes       OR
+      $after.content     != $before.content
+    )
+THEN {
+  UPDATE $after.id SET embedding_status = "нужно-обновить";
+};
+```
+
+Воркер `embedding-worker` подписывается через LIVE SELECT:
+
+```surql
+LIVE SELECT id, kind, text, description, notes, content
+FROM thing
+WHERE embedding_status = "нужно-обновить";
+```
+
+Получает узел → формирует строку для embedding → POST в Ollama/BGE-M3 → обновляет поля:
+
+```surql
+UPDATE thing:xyz SET
+  embedding        = $vector,
+  embedding_status = "актуален",
+  embedding_model  = "bge-m3";
+```
+
+### Пайплайн гибридного поиска (Hybrid RAG)
+
+```
+Запрос пользователя
+  ↓
+embedding-worker векторизует запрос → $query_vec  (BGE-M3)
+  ↓
+┌─────────────────────────────┐   ┌──────────────────────────────┐
+│  Vector search (MTREE)      │   │  BM25 search (SEARCH ANALYZER)│
+│  top-20 по cosine similarity│   │  top-20 по keyword relevance  │
+└─────────────────────────────┘   └──────────────────────────────┘
+  ↓                                  ↓
+  └──────────── RRF merge ───────────┘
+                  ↓
+          объединённый top-40
+                  ↓
+      BGE-Reranker-v2-m3
+      (cross-encoder, точный скоринг)
+                  ↓
+          финальный top-5..10
+                  ↓
+    вставить в system message → LLM (Qwen2.5 32B)
+```
+
+**RRF (Reciprocal Rank Fusion):** `score = 1/(k + rank_vec) + 1/(k + rank_bm25)`, где `k=60`.
+
+```surql
+-- Vector search
+SELECT id, text, kind, about, part_of,
+       vector::similarity::cosine(embedding, $query_vec) AS vec_score
+FROM thing
+WHERE embedding_status = "актуален"
+ORDER BY vec_score DESC LIMIT 20;
+
+-- BM25 search
+SELECT id, text, kind, about, part_of,
+       search::score(1) AS bm25_score
+FROM thing
+WHERE text @1@ $query_text
+   OR description @1@ $query_text
+ORDER BY bm25_score DESC LIMIT 20;
+```
+
+Слияние и reranking выполняет App Server / воркер на Python (FlagEmbedding API).
+
+### Управление памятью GPU
+
+При нехватке VRAM для одновременного LLM + embedding + reranker — модели грузятся по очереди.
+Ollama поддерживает `keep_alive` параметр: модель выгружается через N секунд простоя.
+
+```yaml
+# в конфиге источника данных
+keep_alive: "5m"     # держать LLM в памяти 5 минут после последнего запроса
+```
+
+Embedding и reranker — лёгкие (< 1 GB каждый), держать постоянно.
+LLM — тяжёлый, выгружать при простое если нужна VRAM для других задач.
+
+### Диаграмма: локальный GPU-узел
+
+```mermaid
+graph TD
+    SDB["SurrealDB\n(граф + очереди)"]
+    AppSrv["App Server\n(Next.js)"]
+    EmbWorker["embedding-worker\n(Python)"]
+    Ollama["Ollama\ngpu-server:11434"]
+    FlagEmb["FlagEmbedding\ngpu-server:8001"]
+    Whisper["faster-whisper\ngpu-server:9000"]
+    GPU["RTX 3090 24GB"]
+
+    SDB -->|LIVE SELECT embed_queue| EmbWorker
+    AppSrv -->|hybrid search| EmbWorker
+    EmbWorker -->|embed text| Ollama
+    EmbWorker -->|rerank chunks| FlagEmb
+    AppSrv -->|LLM inference| Ollama
+    AppSrv -->|transcribe audio| Whisper
+    Ollama --> GPU
+    FlagEmb --> GPU
+    Whisper --> GPU
+```
+
+---
+
 ## Открытые вопросы
 
 - [x] История перемещений вещей? → временны́е метки на рёбрах contains / located_at
