@@ -1,5 +1,9 @@
+-include .env
+export
+
 .PHONY: up down restart build logs ps infra web workers \
-        seed shell-db shell-minio \
+        db-init seed shell-db shell-minio \
+        backup restore clean-start \
         test test-ts test-e2e test-py test-py-ai test-py-files test-clean \
         push deploy up-prod build-prod
 
@@ -43,10 +47,11 @@ workers:
 
 ## Создать namespace и database (один раз после первого запуска)
 db-init:
-	curl -sf -X POST http://localhost:$${SURREAL_PORT:-8000}/sql \
+	@AUTH=$$(echo -n "$(SURREAL_USER):$(SURREAL_PASS)" | base64); \
+	curl -sf -X POST http://localhost:$(SURREAL_PORT)/sql \
 		-H "Accept: application/json" \
-		-H "Authorization: Basic $$(echo -n $${SURREAL_USER}:$${SURREAL_PASS} | base64)" \
-		-d "DEFINE NAMESPACE $${SURREAL_NS}; USE NS $${SURREAL_NS}; DEFINE DATABASE $${SURREAL_DB};" \
+		-H "Authorization: Basic $$AUTH" \
+		-d "DEFINE NAMESPACE IF NOT EXISTS $(SURREAL_NS); USE NS $(SURREAL_NS); DEFINE DATABASE IF NOT EXISTS $(SURREAL_DB);" \
 		| python3 -m json.tool
 
 seed:
@@ -69,6 +74,27 @@ shell-minio:
 	$(COMPOSE) exec minio mc alias set local http://localhost:9000 \
 		$${MINIO_USER} $${MINIO_PASS} && \
 	$(COMPOSE) exec minio mc ls local/
+
+# ── Бэкап и восстановление ───────────────────────────────────────────────────
+
+## Создать бэкап (SurrealDB .surql + MinIO файлы) → backups/TIMESTAMP/
+backup:
+	@chmod +x scripts/backup.sh && bash scripts/backup.sh
+
+## Восстановить из последнего бэкапа (или: make restore BACKUP=backups/2026-...)
+restore:
+	@chmod +x scripts/restore.sh && bash scripts/restore.sh $(BACKUP)
+
+## Полный сброс: остановить, удалить volumes, поднять заново, инициализировать
+clean-start:
+	@echo "WARNING: This will destroy all local data."
+	@read -p "Continue? [y/N] " c && [ "$$c" = "y" ] || exit 0
+	$(COMPOSE) down --volumes --remove-orphans
+	$(COMPOSE) up -d surrealdb minio minio-init
+	@echo "Waiting for services..."
+	@sleep 10
+	$(MAKE) db-init
+	@echo "Done. Run 'make seed' or 'make restore' to load data."
 
 # ── Тесты ────────────────────────────────────────────────────────────────────
 

@@ -10,3 +10,5 @@ build/
 .DS_Store
 test-results/*
 !test-results/.gitkeep
+backups/*
+!backups/.gitkeep
