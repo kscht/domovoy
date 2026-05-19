@@ -1,0 +1,158 @@
+services:
+
+  surrealdb-test:
+    image: surrealdb/surrealdb:latest
+    command: start --log error --user root --pass domovoy_surreal_dev memory
+    # memory backend — быстро стартует, данные не сохраняются между прогонами
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  minio-test:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: domovoy
+      MINIO_ROOT_PASSWORD: domovoy_minio_dev
+    tmpfs:
+      - /data    # данные только в RAM, сбрасываются после остановки
+    ports:
+      - "9002:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  minio-test-init:
+    image: minio/mc:latest
+    depends_on:
+      minio-test:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio-test:9000 domovoy domovoy_minio_dev &&
+        mc mb --ignore-existing local/domovoy &&
+        echo 'MinIO test ready'
+      "
+
+  # ── TS тесты (web + TS-воркеры) ────────────────────────────────────────────
+  test-ts:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    command: npm run test
+    environment:
+      SURREAL_URL: ws://surrealdb-test:8000/rpc
+      SURREAL_NS: domovoy-test
+      SURREAL_DB: domovoy
+      SURREAL_USER: root
+      SURREAL_PASS: domovoy_surreal_dev
+      MINIO_ENDPOINT: minio-test:9000
+      MINIO_USER: domovoy
+      MINIO_PASS: domovoy_minio_dev
+      MINIO_BUCKET: domovoy
+      NODE_ENV: test
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    depends_on:
+      surrealdb-test:
+        condition: service_healthy
+      minio-test-init:
+        condition: service_completed_successfully
+
+  # ── E2E тесты (Playwright) ──────────────────────────────────────────────────
+  test-e2e:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    command: npm run test:e2e
+    environment:
+      SURREAL_URL: ws://surrealdb-test:8000/rpc
+      SURREAL_NS: domovoy-e2e
+      SURREAL_DB: domovoy
+      SURREAL_USER: root
+      SURREAL_PASS: domovoy_surreal_dev
+      MINIO_ENDPOINT: minio-test:9000
+      MINIO_USER: domovoy
+      MINIO_PASS: domovoy_minio_dev
+      MINIO_BUCKET: domovoy
+      BASE_URL: http://web-test:3000
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - ./test-results:/app/test-results    # артефакты Playwright
+    depends_on:
+      - web-test
+      - surrealdb-test
+
+  # ── Web под E2E ─────────────────────────────────────────────────────────────
+  web-test:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    command: npm run dev
+    environment:
+      SURREAL_URL: ws://surrealdb-test:8000/rpc
+      SURREAL_NS: domovoy-e2e
+      SURREAL_DB: domovoy
+      SURREAL_USER: root
+      SURREAL_PASS: domovoy_surreal_dev
+      MINIO_ENDPOINT: minio-test:9000
+      MINIO_USER: domovoy
+      MINIO_PASS: domovoy_minio_dev
+      MINIO_BUCKET: domovoy
+      NODE_ENV: test
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    depends_on:
+      surrealdb-test:
+        condition: service_healthy
+
+  # ── Python тесты (worker-ai + worker-files) ─────────────────────────────────
+  test-py-ai:
+    build:
+      context: ./worker-ai
+      dockerfile: Dockerfile.dev
+    command: pytest -v
+    environment:
+      SURREAL_URL: ws://surrealdb-test:8000
+      SURREAL_NS: domovoy-test
+      SURREAL_DB: domovoy
+      SURREAL_USER: root
+      SURREAL_PASS: domovoy_surreal_dev
+      OLLAMA_ENDPOINT: http://host.docker.internal:11434
+    volumes:
+      - ./worker-ai:/app
+    depends_on:
+      surrealdb-test:
+        condition: service_healthy
+
+  test-py-files:
+    build:
+      context: ./worker-files
+      dockerfile: Dockerfile.dev
+    command: pytest -v
+    environment:
+      SURREAL_URL: ws://surrealdb-test:8000
+      SURREAL_NS: domovoy-test
+      SURREAL_DB: domovoy
+      SURREAL_USER: root
+      SURREAL_PASS: domovoy_surreal_dev
+      MINIO_ENDPOINT: minio-test:9000
+      MINIO_USER: domovoy
+      MINIO_PASS: domovoy_minio_dev
+      MINIO_BUCKET: domovoy
+    volumes:
+      - ./worker-files:/app
+    depends_on:
+      surrealdb-test:
+        condition: service_healthy
+      minio-test-init:
+        condition: service_completed_successfully
