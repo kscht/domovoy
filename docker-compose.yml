@@ -177,7 +177,10 @@ services:
 
   # ── Surrealist GUI (self-hosted) ────────────────────────────────────────────
   surrealist:
-    image: surrealdb/surrealist:${SURREALIST_VERSION:-3.8.5}
+    build:
+      context: ./docker/surrealist
+      args:
+        SURREALIST_VERSION: ${SURREALIST_VERSION:-surrealist-v3.8.5}
     restart: unless-stopped
     ports:
       - "${SURREALIST_PORT:-8080}:8080"
