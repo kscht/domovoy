@@ -4,13 +4,14 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:latest
     restart: unless-stopped
+    user: root
     command: start --log info --user ${SURREAL_USER} --pass ${SURREAL_PASS} rocksdb:/data/domovoy
     volumes:
       - surrealdb_data:/data
     ports:
       - "${SURREAL_PORT:-8000}:8000"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
       interval: 5s
       timeout: 3s
       retries: 10

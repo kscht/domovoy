@@ -41,12 +41,22 @@ workers:
 
 # ── База данных ───────────────────────────────────────────────────────────────
 
+## Создать namespace и database (один раз после первого запуска)
+db-init:
+	curl -sf -X POST http://localhost:$${SURREAL_PORT:-8000}/sql \
+		-H "Accept: application/json" \
+		-H "Authorization: Basic $$(echo -n $${SURREAL_USER}:$${SURREAL_PASS} | base64)" \
+		-d "DEFINE NAMESPACE $${SURREAL_NS}; USE NS $${SURREAL_NS}; DEFINE DATABASE $${SURREAL_DB};" \
+		| python3 -m json.tool
+
 seed:
-	$(COMPOSE) exec surrealdb surreal import \
-		--conn http://localhost:8000 \
-		--user $${SURREAL_USER} --pass $${SURREAL_PASS} \
-		--ns $${SURREAL_NS} --db $${SURREAL_DB} \
-		/scripts/seed.surql
+	curl -sf -X POST http://localhost:$${SURREAL_PORT:-8000}/sql \
+		-H "Accept: application/json" \
+		-H "surreal-ns: $${SURREAL_NS}" \
+		-H "surreal-db: $${SURREAL_DB}" \
+		-H "Authorization: Basic $$(echo -n $${SURREAL_USER}:$${SURREAL_PASS} | base64)" \
+		--data-binary @scripts/seed.surql \
+		| python3 -m json.tool
 
 shell-db:
 	$(COMPOSE) exec surrealdb surreal sql \
