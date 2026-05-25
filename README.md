@@ -136,3 +136,4 @@ domovoy/
 
 - [`docs/database.md`](docs/database.md) — вся схема данных, диаграммы Mermaid, примеры SurrealQL
 - [`docs/comparison.md`](docs/comparison.md) — сравнение с Notion, n8n, NetBox, Obsidian и другими
+- [`docs/access-control.md`](docs/access-control.md) — модель доступа и маппинг на пользователей / PERMISSIONS SurrealDB

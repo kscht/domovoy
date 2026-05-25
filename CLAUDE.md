@@ -62,7 +62,8 @@ domovoy/
 │   └── import_fixtures.py      — загрузка медиафайлов в MinIO
 └── docs/
     ├── database.md          — полная схема (~9500 строк)
-    └── comparison.md        — сравнение с конкурентами
+    ├── comparison.md        — сравнение с конкурентами
+    └── access-control.md    — модель доступа и маппинг на SurrealDB
 ```
 
 ## Текущий статус
