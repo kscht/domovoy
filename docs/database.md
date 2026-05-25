@@ -1017,6 +1017,12 @@ DEFINE TABLE promised_to TYPE RELATION FROM thing TO thing;
 
 -- Поле params на requires: для передачи конфигурации модулю/рантайму
 DEFINE FIELD params ON requires TYPE option<object>;
+
+-- Версионирование (см. раздел «Версии и совместимость»)
+DEFINE TABLE supersedes TYPE RELATION FROM thing TO thing SCHEMALESS;
+
+-- Декларация совместимости потребителя с версией семейства (semver-диапазон)
+DEFINE FIELD constraint ON requires TYPE option<string>;
 ```
 
 ### Индексы
