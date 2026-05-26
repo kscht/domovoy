@@ -142,3 +142,4 @@ domovoy/
 - [`docs/kind-audit.md`](docs/kind-audit.md) — аудит kind в seed, миграция 56→27 ASCII-канонических, иерархия категорий, SKOS-словари
 - [`docs/ui-architecture.md`](docs/ui-architecture.md) — UI как данные: универсальный движок на виджетах с контрактами и декларативной композицией из каталога
 - [`docs/roadmap-inventory.md`](docs/roadmap-inventory.md) — роадмап первой вертикали (инвентарь + места хранения): 10 фаз × 1–3 дня, прокатывает всю архитектуру
+- [`docs/categorization.md`](docs/categorization.md) — как происходит категоризация: 6 моментов × 5 источников × 3 роли; стартуем с пустого каталога, дерево вырастает из кликов
