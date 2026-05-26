@@ -1,6 +1,6 @@
 -- Домовой: тестовый датасет
 -- Сгенерирован: 2026-05-19 06:29
--- ~1000 нодов, 1143 рёбра, все 26 типов рёбер
+-- ~1000 нодов, 1143 рёбра, все 27 типов рёбер
 
 -- ── Люди ──────────────────────────────────────────────────────────────────
 CREATE thing:`user_papa` SET kind = 'человек', name = 'Папа', role = 'папа', created_at = time::now();
@@ -2444,10 +2444,22 @@ RELATE thing:`task_to_bmw_2026`->used->thing:`reglament_to_bmw@2` SET resolved_a
 RELATE thing:`task_to_bmw_2026`->about->thing:`moto_bmw`;
 RELATE thing:`task_to_bmw_2026`->assigned_to->thing:`user_papa`;
 
+-- ── derived_from (происхождение / lineage) ─────────────────────────────────
+-- Цепочка PDF → чанк → embedding + миниатюра из скана ОСАГО BMW
+CREATE thing:`file_osago_bmw_scan` SET kind = 'файл', name = 'Скан ОСАГО BMW 2026.pdf', mime = 'application/pdf', created_at = time::now();
+RELATE thing:`file_osago_bmw_scan`->represents->thing:`осаго_bmw_2026`;
+CREATE thing:`chunk_osago_bmw_001` SET kind = 'чанк', name = 'ОСАГО BMW — чанк 1', text = 'Страхователь, период страхования, КБМ...', created_at = time::now();
+RELATE thing:`chunk_osago_bmw_001`->derived_from->thing:`file_osago_bmw_scan` SET method = 'chunk', at = time::now();
+CREATE thing:`emb_osago_bmw_001` SET kind = 'embedding', name = 'ОСАГО BMW — embedding чанка 1', dim = 1024, created_at = time::now();
+RELATE thing:`emb_osago_bmw_001`->derived_from->thing:`chunk_osago_bmw_001` SET method = 'embed', at = time::now();
+CREATE thing:`file_osago_bmw_thumb` SET kind = 'файл', name = 'ОСАГО BMW — миниатюра', mime = 'image/webp', created_at = time::now();
+RELATE thing:`file_osago_bmw_thumb`->derived_from->thing:`file_osago_bmw_scan` SET method = 'thumbnail', at = time::now();
+
 -- Датасет готов.
 -- Вещей: 779 | Локаций: 63
 -- Рёбра: contains, part_of, assigned_to, about, depends_on,
 --        lent_to, borrowed_from, triggered_by, expert_in, answered,
 --        promised_to, represents, can_access, related_to, references,
 --        identified_by, linked_to, invalidates, filed_with, participant,
---        located_at, produces, used, needs, requires, supersedes  [все 26]
+--        located_at, produces, used, needs, requires, supersedes,
+--        derived_from  [все 27]

@@ -1025,7 +1025,20 @@ DEFINE TABLE supersedes TYPE RELATION FROM thing TO thing SCHEMALESS;
 
 -- Декларация совместимости потребителя с версией семейства (semver-диапазон)
 DEFINE FIELD constraint ON requires TYPE option<string>;
+
+-- Инвалидация кэша / пересборки (см. раздел «Публикации»)
+DEFINE TABLE invalidates TYPE RELATION FROM thing TO thing SCHEMALESS;
+
+-- Происхождение артефактов / lineage (см. раздел «Происхождение артефактов»)
+DEFINE TABLE derived_from TYPE RELATION FROM thing TO thing SCHEMALESS;
+DEFINE FIELD method ON derived_from TYPE option<string>;        -- chunk|embed|thumbnail|translate|summarize|train|extract
+DEFINE FIELD run    ON derived_from TYPE option<record<thing>>; -- узел kind:запуск, если трансформация была оркестрована
+DEFINE FIELD at     ON derived_from TYPE option<datetime>;
 ```
+
+> Рёбра `FROM thing TO thing` не ограничивают концы. Как добавить типизацию связей
+> (какой `kind` каким предикатом соединяется с каким `kind`), не теряя свободы —
+> через каталог-данные и градуированный enforcement — см. [relation-typing.md](relation-typing.md).
 
 ### Индексы
 
@@ -8886,6 +8899,66 @@ graph TD
 - «текущая» — opt-in (голова цепочки), не дефолтный предикат обхода.
 - живые связи указывают на семейство-узел; провенанс и пины — на версию-узел.
 - снятие (`retired`) — только когда версия осиротела (никто не `used` / `requires`).
+
+---
+
+## Происхождение артефактов (lineage)
+
+Ребро `derived_from` фиксирует **генеалогию артефактов**: `B → derived_from → A` читается «**B получено из A**». Стрелка идёт от производного к источнику; голова цепочки (`derived_from = NONE`) — первоисточник. Это прямая калька W3C PROV `wasDerivedFrom` — связь **узел→узел между сущностями**, без обязательного посредника-процесса.
+
+Отвечает на два вопроса: «откуда это взялось» (вперёд по ребру) и «что из этого наделали» (назад) — обходом графа, а не реконструкцией.
+
+### Граница с соседними рёбрами
+
+| Ребро | Отношение | Чем отличается от `derived_from` |
+|---|---|---|
+| `part_of` | B — *часть* A | thumbnail не часть оригинала, он *из* него получен; производное — самостоятельный узел, а не компонент целого. |
+| `represents` | B — *копия* A | скан = та же сущность в цифре; саммари — **не копия** документа, а новый объект, выведенный из него. |
+| `produces` | *активность* → результат | слева запуск/процесс (PROV Activity), а не артефакт. |
+| `used` | активность ← вход | требует узла-процесса; `derived_from` соединяет вход и выход напрямую. |
+| `references` | B *ссылается* на A | ссылка — указатель (убери — B не изменится); производность генетическая (без A узла B бы не было). |
+
+### Поля
+
+```surql
+DEFINE TABLE derived_from TYPE RELATION FROM thing TO thing SCHEMALESS;
+DEFINE FIELD method ON derived_from TYPE option<string>;        -- chunk|embed|thumbnail|translate|summarize|train|extract
+DEFINE FIELD run    ON derived_from TYPE option<record<thing>>; -- узел kind:запуск, если был оркестрован
+DEFINE FIELD at     ON derived_from TYPE option<datetime>;
+```
+
+`run` — мост к тяжёлому провенансу: если за производной стоял настоящий прогон пайплайна, ребро ссылается на узел `kind:запуск`; для дешёвых массовых производных (thumbnail, чанк) `run = NONE`, и хватает лёгкого ярлыка.
+
+### Примеры по доменам
+
+```
+thumbnail   → derived_from → original_image      (method: thumbnail)
+chunk_007   → derived_from → contract.pdf        (method: chunk)
+embedding   → derived_from → chunk_007           (method: embed)
+перевод_RU  → derived_from → субтитры_EN         (method: translate)
+саммари     → derived_from → инцидент_отчёт      (method: summarize)
+модель_v3   → derived_from → датасет_2026        (method: train, run: thing:run_...)
+ответ_бота  → derived_from → chunk_007, chunk_012 (grounding: чем обоснован ответ)
+```
+
+Последняя строка — почему это попадает в ML-сценарий: «какие именно чанки обосновали ответ» становится **рёбрами графа**, а не теряется внутри `inputs`-запроса. Воспроизводимость и аудит цитат — обходом по рёбрам.
+
+### Обход
+
+```surql
+-- происхождение: из чего в конечном счёте сделан артефакт
+SELECT ->derived_from->thing.* FROM thing:модель_v3;          -- на один шаг
+SELECT * FROM thing:модель_v3 DEPTH 5 FETCH ->derived_from;   -- вся родословная
+
+-- влияние: что унаследует пересборку, если переразметить датасет (impact analysis)
+SELECT <-derived_from<-thing.* FROM thing:датасет_2026;
+```
+
+### `derived_from` vs run-as-hub
+
+Полное происхождение собирается и через узел `kind:запуск` ←`used`/`produces`→. Но это требует узла-процесса на *каждую* трансформацию — оправдано для оркестрованных прогонов (аудируемая активность), абсурдно для массовых дешёвых производных. `derived_from` — статический генетический ярлык «откуда», `produces`/`used` — динамический протокол «что прогон сделал». Поле `run` сшивает их, когда уместны оба. Они дополняют друг друга, а не конкурируют.
+
+> `invalidates` (см. раздел «Публикации») — соседнее, но иное: оно про **распространение пересборки** вперёд («изменение A инвалидирует кэш B»), тогда как `derived_from` про **происхождение** назад («B сделано из A»). Часто это одни и те же пары узлов, прочитанные в разные стороны и с разной целью.
 
 ---
 

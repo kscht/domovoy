@@ -9,7 +9,7 @@ Self-hosted граф-система управления жизнью семьи
 
 ## Ключевые архитектурные решения
 
-**Граф-модель:** одна таблица `thing` (schemaless), 26 типизированных рёбер. Никаких отдельных таблиц под домены. Новый домен = новые `kind`-значения у `thing`, не новые таблицы.
+**Граф-модель:** одна таблица `thing` (schemaless), 27 типизированных рёбер. Никаких отдельных таблиц под домены. Новый домен = новые `kind`-значения у `thing`, не новые таблицы.
 
 **Воркеры — конкурирующие потребители:** атомарный захват задачи через `UPDATE ... WHERE status = "ожидание" AND locked_by = NONE`. Язык воркера не важен — TS, Python, Go подключаются к одной очереди. Фильтрация по `kind` + `subtype`.
 
@@ -56,14 +56,15 @@ domovoy/
 ├── worker-ai/               — Python: embeddings, reranker, Whisper, vision
 ├── worker-files/            — Python: chunking, OCR, thumbnails
 ├── scripts/
-│   ├── seed.surql              — тестовый датасет (2161 оператор, все 26 рёбер)
+│   ├── seed.surql              — тестовый датасет (2161 оператор, все 27 рёбер)
 │   ├── generate_seed.py        — генератор основного датасета
 │   ├── generate_forum_seed.py  — wiki/чаты из forum30.jsonl
 │   └── import_fixtures.py      — загрузка медиафайлов в MinIO
 └── docs/
     ├── database.md          — полная схема (~9500 строк)
     ├── comparison.md        — сравнение с конкурентами
-    └── access-control.md    — модель доступа и маппинг на SurrealDB
+    ├── access-control.md    — модель доступа и маппинг на SurrealDB
+    └── relation-typing.md   — типизация связей (каталог рёбер, gradual typing)
 ```
 
 ## Текущий статус
@@ -71,7 +72,7 @@ domovoy/
 - [x] Полная схема данных в `docs/database.md`
 - [x] Docker Compose: dev + prod + test
 - [x] Makefile с командами
-- [x] `scripts/seed.surql` — 2161 оператор, все 26 типов рёбер
+- [x] `scripts/seed.surql` — 2161 оператор, все 27 типов рёбер
 - [x] Surrealist GUI контейнер (`docker/surrealist/`, profile: tools) — см. проблему ниже
 - [ ] `web/` — инициализировать Next.js проект
 - [ ] `worker-scheduler/` — минимальный воркер
