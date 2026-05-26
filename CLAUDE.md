@@ -64,7 +64,9 @@ domovoy/
     ├── database.md          — полная схема (~9500 строк)
     ├── comparison.md        — сравнение с конкурентами
     ├── access-control.md    — модель доступа и маппинг на SurrealDB
-    └── relation-typing.md   — типизация связей (каталог рёбер, gradual typing)
+    ├── relation-typing.md   — типизация связей (каталог рёбер, gradual typing)
+    ├── kind-audit.md        — аудит kind, миграция 56→27, иерархия категорий, SKOS
+    └── ui-architecture.md   — UI как данные (виджеты + декларативная композиция)
 ```
 
 ## Текущий статус

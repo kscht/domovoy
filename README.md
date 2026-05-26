@@ -139,3 +139,5 @@ domovoy/
 - [`docs/comparison.md`](docs/comparison.md) — сравнение с Notion, n8n, NetBox, Obsidian и другими
 - [`docs/access-control.md`](docs/access-control.md) — модель доступа и маппинг на пользователей / PERMISSIONS SurrealDB
 - [`docs/relation-typing.md`](docs/relation-typing.md) — типизация связей через каталог-данные (gradual typing), ответ на критику «schemaless = хаос»
+- [`docs/kind-audit.md`](docs/kind-audit.md) — аудит kind в seed, миграция 56→27 ASCII-канонических, иерархия категорий, SKOS-словари
+- [`docs/ui-architecture.md`](docs/ui-architecture.md) — UI как данные: универсальный движок на виджетах с контрактами и декларативной композицией из каталога
