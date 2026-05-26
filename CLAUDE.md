@@ -66,7 +66,8 @@ domovoy/
     ├── access-control.md    — модель доступа и маппинг на SurrealDB
     ├── relation-typing.md   — типизация связей (каталог рёбер, gradual typing)
     ├── kind-audit.md        — аудит kind, миграция 56→27, иерархия категорий, SKOS
-    └── ui-architecture.md   — UI как данные (виджеты + декларативная композиция)
+    ├── ui-architecture.md   — UI как данные (виджеты + декларативная композиция)
+    └── roadmap-inventory.md — роадмап первой вертикали: инвентарь + места хранения
 ```
 
 ## Текущий статус
