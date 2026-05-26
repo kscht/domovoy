@@ -1,54 +1,105 @@
 # Аудит `kind` в seed — план миграции
 
-Аналитический документ перед фактической миграцией. Решает три задачи сразу:
-1. инвентаризация русских `kind`-значений и переход на ASCII-канонические;
-2. унификация трёх параллельных реестров под SKOS-шаблон `vocabulary` + `concept`;
-3. **соглашение о полях для внешних якорей** (Wikidata / ISO / IANA / WHO / NCBI / CPE) — закладываем структуру сразу, чтобы не переделывать.
+Аналитический документ перед фактической миграцией. Решает четыре задачи сразу:
+
+1. зафиксировать **строгий тест на отдельный `kind`** — чтобы будущие кандидаты прогонялись единообразно;
+2. зафиксировать **принципы категоризации** — чтобы `category` была деревом, а не плоским мусором;
+3. инвентаризация русских `kind`-значений и переход на ASCII-канонические;
+4. унификация реестров под SKOS-шаблон `vocabulary` + `concept` с внешними якорями (Wikidata / ISO / IANA / WHO / NCBI / CPE) — структура закладывается сразу.
 
 Контекст:
 - ASCII snake_case как канонический язык — диалог по типизации шины;
-- 4 класса бытия (item/device/content/living) и тест «`kind` стабилен через лайфсайкл» — там же;
+- 4 класса бытия (item / device / content / living) — там же;
 - модель типизации связей — [`relation-typing.md`](relation-typing.md);
-- решение про глобальный таксономический словарь — раздел ниже.
+- глобальный таксономический словарь — раздел ниже.
+
+## Тест: что заслуживает отдельного `kind`
+
+Чтобы новая сущность X получила отдельный `kind`, должно выполняться **хотя бы одно** из трёх:
+
+| # | Критерий | Пример |
+|---|----------|--------|
+| 1 | **Эксклюзивное ребро или ребро меняет семантику** | `can_access` на `device` обретает PAM-смысл (login/sudo), а не «видеть запись» |
+| 2 | **Отдельный state machine** с переходами, которых нет у соседнего класса | `appeal`: filed→review→decided→appealed; `incident`: reported→triage→mitigating→resolved→post-mortem |
+| 3 | **Отдельный способ существования** | `device`: кибер+физика; `living`: биология; `content`: чистая цифра |
+
+**Недостаточно для отдельного `kind`:**
+- «у меня свой UI-экран» — это фильтр в UI, не структура данных;
+- «много полей и анкета» — это поля на узле;
+- «развитый workflow» — это `category` + поля + шаблоны (`triggered_by`, `log_entry`);
+- «концептуально другое» — UX-аргумент в маске структурного.
+
+Каждое предложение нового `kind` должно явно отвечать «по какому из трёх критериев». Если ни по одному — это `category` или поле.
+
+## Принципы категоризации (`category`)
+
+1. **Категория — это одна метка, не вся таксономия.** Узел несёт **один** `category`-slug удобного уровня. Полное место в иерархии — в графе словаря через `part_of` между концептами. Запрос «всё агрохимия» обходит иерархию, даже если айтем тегирован как `fertilizer`.
+
+2. **Категоризация — по workflow, не по химии.** Айтемы попадают в один бакет, если **в одну выборку по делу** — общий список покупок, общая полка, общие задачи ухода. Молекулярное родство не важно.
+
+3. **Wikidata делает работу за тебя.** Не нужно изобретать 200 ручных категорий. Айтем несёт `wikidata` Q-id максимально специфичной сущности; глубокая таксономия (классы Wikidata через `wd:P279`) приходит бесплатно.
+
+4. **Многомерность — через теги, не через несколько категорий.** Категория **одна**; «органическое», «импортное», «опасное», «новое» — это `tag`-узлы через `related_to {label:'тег'}`.
+
+5. **Начинай широко, дроби только при плотности.** 15 широких бакетов на старте. Когда в `chemistry` накопилось 80 реактивов и появился осмысленный workflow — заводим подконцепты в словаре, у части айтемов уточняем `category`. **Граф ничего не ломает**, принимает любую глубину уточнения.
 
 ## Исходные числа
 
 - **56 уникальных** значений `kind` в `scripts/seed.surql`
 - **1004 узла** с проставленным `kind`
-- мигрируем в **29 канонических** `kind`
+- мигрируем в **27 канонических** `kind`
 
 ## 4 класса бытия
 
 | Класс | Канонические `kind` | Признак |
 |---|---|---|
-| **item** (пассивная физика) | `item`, `vehicle` | хранится / одалживается / расходуется |
+| **item** (пассивная физика) | `item` | хранится / одалживается / расходуется; включает транспорт (через category) |
 | **device** (физика + сеть) | `device` | hostname, IP, креды, удалённый доступ (PAM) |
-| **content** (чистая цифра) | `document`, `document_family`, `file`, `chunk`, `embedding`, `note`, `page`, `message`, `log_entry` | байты / семантика |
+| **content** (чистая цифра) | `document`, `file`, `chunk`, `embedding`, `note`, `page`, `message`, `log_entry` | байты / семантика |
 | **living** (биологический агент) | `person`, `animal`, `plant` | здоровье, лайфсайкл, забота, неотчуждаемая идентичность |
 | места / события / workflow | `location`, `task`, `appeal`, `payment`, `event`, `incident`, `listing`, `diagnosis` | — |
 | сущности / группы | `group`, `org` | — |
 | шаблоны / теги | `template`, `tag` | — |
-| **таксономия (мета)** | `vocabulary`, `concept` | словари + термины (SKOS-шаблон) |
+| таксономия (мета) | `vocabulary`, `concept` | SKOS-словари + термины |
 
-## Канонический список kind (29 значений)
+## Канонический список `kind` (27 значений)
 
 ```
-Физика:           item, vehicle, device, location                                (4)
-Контент:          document, document_family, file, chunk, embedding,
-                  note, page, message, log_entry                                 (9)
-Живое:            person, animal, plant                                          (3)
-Workflow/события: task, appeal, payment, event, incident, listing, diagnosis    (7)
-Сущности:         group, org                                                     (2)
-Шаблоны/теги:     template, tag                                                  (2)
-Таксономия:       vocabulary, concept                                            (2)
-                                                                          итого: 29
+Физика:           item, device, location                                            (3)
+Контент:          document, file, chunk, embedding, note, page, message, log_entry  (8)
+Живое:            person, animal, plant                                              (3)
+Workflow/события: task, appeal, payment, event, incident, listing, diagnosis        (7)
+Сущности:         group, org                                                         (2)
+Шаблоны/теги:     template, tag                                                      (2)
+Таксономия:       vocabulary, concept                                                (2)
+                                                                              итого: 27
 ```
 
-Конвенция слагов: **snake_case ASCII** (единообразие с предикатами `assigned_to`, `derived_from`).
+Каждый прошёл тест:
+
+| `kind` | Прошёл по критерию |
+|---|---|
+| `item` | базовый класс физики |
+| `device` | 1, 3 — `can_access` = PAM-семантика; кибер-физическая двойственность |
+| `location` | 1 — `contains` исходит отсюда, нет `lent_to` |
+| `document` / `file` / `chunk` / `embedding` | 1 — специфические рёбра (`represents`, `derived_from`, MTREE-индекс) |
+| `note` / `page` / `message` / `log_entry` | 1, 2 — разные state machines (draft→published; append-only счётчики; ветвление сообщений) |
+| `person` / `animal` / `plant` | 3 — разные природы существования |
+| `task` / `appeal` / `payment` / `event` / `incident` / `listing` / `diagnosis` | 2 — разные state machines |
+| `org` / `group` | 1 — `filed_with` принимает только `org`; членство через `part_of` |
+| `template` | 1 — порождает экземпляры через `part_of` |
+| `tag` | 2 — ad-hoc метки, не курируемый словарь |
+| `vocabulary` / `concept` | 1 — мета-уровень, рёбра SKOS-семантики |
+
+**Что не получило `kind` и почему:**
+- `vehicle` — нет эксклюзивных рёбер, state machine как у `item`, природа физическая → `item` + `category` с иерархией;
+- `document_family` — это `document` с флагом `is_family=true` (тот же state machine, нет эксклюзивных рёбер).
+
+Конвенция слагов: **snake_case ASCII** (единообразие с предикатами).
 
 ## Глобальный таксономический словарь
 
-Все «контролируемые перечисления» (типы узлов/рёбер, категории, статусы, роли, валюты, языки, MIME, ICD, виды и т.п.) унифицированы под W3C SKOS:
+Все контролируемые перечисления (типы узлов/рёбер, категории, статусы, роли, валюты, языки, MIME, ICD, виды и т.п.) унифицированы под W3C SKOS:
 
 - `kind = 'vocabulary'` — узел словаря (ConceptScheme)
 - `kind = 'concept'` — узел термина (Concept)
@@ -57,99 +108,94 @@ Workflow/события: task, appeal, payment, event, incident, listing, diagno
 - `concept → related_to → concept` — sameAs / related
 - `concept → references → external` — авторитативный URL
 - `_i18n` на концепте — prefLabel + переводы
-- `supersedes` — устаревший термин заменён
+- `supersedes` — устаревший термин
 
 Никаких новых рёбер не нужно — все 27 покрывают SKOS-семантику.
 
-### Свои словари (заводим)
+### Свои словари
 
 | Словарь | Цель | ≈ Размер |
 |---|---|---|
-| `vocab:domovoy_kind` | 29 канонических `kind` | 29 |
+| `vocab:domovoy_kind` | 27 канонических `kind` | 27 |
 | `vocab:domovoy_edge` | 27 типов рёбер | 27 |
-| `vocab:domovoy_category` | категории item (`tool`, `fertilizer`, ...) | ~35 |
-| `vocab:domovoy_brand` | бренды (для item/device/vehicle) | растёт |
+| `vocab:domovoy_category` | категории для `item` (иерархия — см. ниже) | ~50 |
+| `vocab:domovoy_brand` | бренды | растёт |
 | `vocab:domovoy_status` | enum статусов | ~10 |
-| `vocab:domovoy_role` | `role` на device (`server`/`workstation`/`router`/...) | ~8 |
-| `vocab:domovoy_permission` | права на can_access (`view`/`edit`/`login`/`sudo`/...) | ~10 |
+| `vocab:domovoy_role` | `role` на `device` | ~8 |
+| `vocab:domovoy_permission` | права на `can_access` | ~10 |
 | `vocab:domovoy_family_role` | роли в семье | ~6 |
-| `vocab:domovoy_lifecycle` | стадии для living (seed/sprout/.../senescence) | ~10 |
+| `vocab:domovoy_lifecycle` | стадии для living | ~10 |
 | `vocab:domovoy_derived_method` | значения `derived_from.method` | ~7 |
 
 ### Внешние словари (минимальный набор сразу)
 
 | Внешний словарь | Заводить сейчас? | Где используется |
 |---|---|---|
-| **Wikidata** (`vocab:wikidata`) | **да**, как universal-anchor | поле `wikidata` на любом узле |
+| **Wikidata** (`vocab:wikidata`) | **да**, universal-anchor | поле `wikidata` на любом узле |
 | **ISO 4217** валюты | **да**, минимально (RUB+) | `payment.currency` |
 | **ISO 639** языки | **да**, минимально (ru, en) | `_lang`, ключи `_i18n` |
-| **IANA MIME** | **да**, по факту использования | `file.mime` |
+| **IANA MIME** | **да**, по факту | `file.mime` |
 | **ISO 3166** страны | нет, по запросу | адреса |
 | **WHO ICD-10/11** | нет, при первом `diagnosis` | `diagnosis.icd` |
-| **WHO ATC** лекарства | нет, при первом medicine | `item.atc` |
+| **WHO ATC** | нет, при первом medicine | `item.atc` |
 | **NCBI Taxonomy** | нет, при первом `animal`/`plant` | `animal.taxon_id` |
 | **GS1 GTIN** | нет, при первом скане | `item.gtin` |
-| **NIST CPE** | нет, при первом `incident` | `device.cpe`, `incident.cpe` |
+| **NIST CPE** | нет, при первом IT-incident | `device.cpe`, `incident.cpe` |
 | **schema.org** | нет | внешние якоря через `references` |
 
 ## Соглашение о внешних якорях: поля на узлах
 
-Поля **денормализуют** идентификаторы для скорости и удобства запросов. Авторитативная версия — в графе через `concept` в соответствующем `vocabulary`.
+Поля **денормализуют** идентификаторы для скорости. Авторитет — в графе через `concept` в соответствующем `vocabulary`.
 
 ### Универсальное поле `wikidata`
 
-Любой узел может нести поле **`wikidata`** — строку Q-id максимально специфичной сущности Wikidata:
+Любой узел может нести **`wikidata`** — Q-id максимально специфичной сущности:
 
 ```surql
 -- модель есть в Wikidata — указываем модель
-CREATE thing:`moto_bmw` SET kind='vehicle', wikidata='Q57821567', ...;     -- BMW R 1250 GS
+CREATE thing:`moto_bmw` SET kind='item', category='motorcycle',
+  wikidata='Q57821567', name='BMW R 1250 GS';
 
--- модели нет, есть семейство — указываем семейство
-CREATE thing:`laptop_dad` SET kind='device', wikidata='Q861126', ...;       -- ThinkPad (серия)
+-- модели нет, есть семейство
+CREATE thing:`laptop_dad` SET kind='device', wikidata='Q861126', ...;
 
--- только категория — указываем класс
-CREATE thing:`fridge_kitchen` SET kind='item', wikidata='Q37828', ...;      -- refrigerator
+-- только категория
+CREATE thing:`fridge_kitchen` SET kind='item', category='refrigerator',
+  wikidata='Q37828', ...;
 ```
 
-Через `wikidata` мост к 300+ языкам, GTIN/UNSPSC/GPC/ATC/ICD-маппингам и связанным сущностям — без bulk-импорта.
-
 ### Доменно-специфичные идентификаторы
-
-Сиблинги `wikidata`, по необходимости для класса:
 
 | Поле | Класс/контекст | Стандарт |
 |---|---|---|
 | `gtin` | `item` (покупное) | GS1 GTIN-13 (штрих-код) |
 | `isbn` | `item` категории `book` или `document` | ISBN |
-| `vin` | `vehicle` | ISO 3779 |
-| `license_plate` | `vehicle` | гос. номер |
+| `vin` | `item` категории `vehicle/*` | ISO 3779 |
+| `license_plate` | `item` категории `vehicle/*` | гос. номер |
 | `mac` | `device` | IEEE 802 |
 | `hostname` | `device` | DNS |
 | `imei` | `device` (телефон) | 3GPP |
 | `cpe` | `device` (OS/софт), `incident` | NIST CPE |
 | `taxon_id` | `animal`, `plant` | NCBI Taxonomy |
 | `microchip` | `animal` | ISO 11784/11785 |
-| `cultivar` | `plant` | ICRA (Cultivated Plant Code) |
-| `atc` | `item` категории `medicine` | WHO ATC |
+| `cultivar` | `plant` | ICRA |
+| `atc` | `item` категории `medicine/*` | WHO ATC |
 | `icd` | `diagnosis` | WHO ICD-10/11 |
 | `snomed` | `diagnosis` | SNOMED CT |
 | `doi` | `document` (научный) | DOI |
-| `cve` | `incident` (security) | MITRE CVE |
+| `cve` | `incident` | MITRE CVE |
 | `inn`, `ogrn` | `org` (РФ) | ФНС |
 
 ### Что несут разные классы
 
-Минимальные обязательные + типичные внешние якоря по классам:
-
 | Класс | Обязательно | Типичные внешние якоря |
 |---|---|---|
-| `item` | `name`, `category` | `wikidata`, `gtin`, `brand` |
-| `vehicle` | `name`, `brand`, `model` | `wikidata`, `vin`, `license_plate` |
-| `device` | `name`, `role` | `wikidata`, `mac`, `hostname`, `cpe` (OS), `imei`, `gtin` |
+| `item` | `name`, `category` | `wikidata`, `gtin`, `brand`; **`vin`/`license_plate` если транспорт; `atc` если medicine** |
+| `device` | `name`, `role` | `wikidata`, `mac`, `hostname`, `cpe`, `imei`, `gtin` |
 | `person` | `name` | `wikidata` (если общественный), `birth_date` |
 | `animal` | `name`, `species` | `wikidata`, `taxon_id`, `microchip` |
 | `plant` | `name`, `species`, `stage` | `wikidata`, `taxon_id`, `cultivar` |
-| `document` | `name`, `mime` | `isbn`, `doi`, `wikidata` |
+| `document` | `name`, `mime` | `isbn`, `doi`, `wikidata`; `is_family=true` для head-узла версионирования |
 | `payment` | `amount`, `currency` (ISO 4217) | `wikidata` (для редких) |
 | `diagnosis` | `code` | `icd`, `snomed`, `wikidata` |
 | `incident` | `name` | `cve`, `cpe` |
@@ -158,8 +204,6 @@ CREATE thing:`fridge_kitchen` SET kind='item', wikidata='Q37828', ...;      -- r
 
 ### `brand` — поле + концепт
 
-Бренд хранится как **slug** на узле (`brand = 'bosch'`) и как **концепт** в `vocab:domovoy_brand`. Концепт несёт `wikidata` Q-id и `_i18n`:
-
 ```surql
 CREATE thing:`concept_brand_bosch` SET
   kind='concept', identifier='bosch', wikidata='Q234021',
@@ -167,16 +211,75 @@ CREATE thing:`concept_brand_bosch` SET
 RELATE thing:`concept_brand_bosch`->part_of->thing:`vocab_domovoy_brand`;
 ```
 
+На айтеме `brand='bosch'` — slug в реестр.
+
+## Иерархия категорий в `vocab:domovoy_category`
+
+Закладываем дерево сразу для очевидных parent-child пар. Остальное — плоско до появления плотности. Все категории — `kind='concept'`, иерархия через `part_of` между ними.
+
+```
+food                          ← новая широкая категория
+reagent (chemistry)           ← новая широкая категория для реактивов
+cleaning                      ← новая широкая категория
+medicine
+tool
+├── hand_tool
+└── power_tool
+    └── rotary_hammer
+vehicle                       ← была kind, теперь концепт-категория
+├── car
+├── motorcycle
+├── boat
+├── snowmobile
+└── bicycle
+vehicle_supplies
+├── auto_part
+├── auto_accessory
+└── moto_accessory
+garden_supplies
+├── garden_tool
+├── seeds
+├── sapling
+├── substrate
+└── agrochemistry
+    ├── fertilizer
+    ├── growth_regulator
+    └── pesticide
+household_supplies
+├── household
+├── consumable
+├── container               ← бывшая "тара"
+└── fastener
+sports
+├── fishing
+├── marine_gear
+└── tourism
+electronics                  ← в коробке, без сети
+electrical                   ← розетки/провода/выключатели
+plumbing
+construction
+clothing
+book
+audio                        ← наушники/колонки bluetooth
+storage_media                ← флешки/SSD/HDD
+peripheral                   ← мониторы/клавы/мыши
+navigation
+photo_video
+misc                         ← честное "не классифицировал"
+```
+
+Принцип «начинай широко»: если у тебя пять реактивов в шкафу — `reagent` хватит. Когда наберётся 80 и захочется отдельно фильтровать кислоты/основания/растворители — заводишь подконцепты, переразмечаешь часть айтемов. Граф не ломается.
+
 ## Стартовый набор концептов с Wikidata Q-id (верифицировано)
 
-Q-id подтверждены через `wbsearchentities`. Заводим в seed для каждого с привязкой к нашим `concept`-узлам.
+Q-id подтверждены через `wbsearchentities`. Заводим в seed с привязкой к нашим `concept`-узлам.
 
 ### Категории (`vocab:domovoy_category` → Wikidata)
 
 | Наш `category` | Wikidata Q-id | Wikidata label |
 |---|---|---|
-| `laptop` | Q3962 | laptop / ноутбук |
-| `refrigerator` | Q37828 | refrigerator / холодильник |
+| `laptop` (под `electronics` или верхний уровень?) | Q3962 | laptop |
+| `refrigerator` | Q37828 | refrigerator |
 | `washing_machine` | Q124441 | washing machine |
 | `dishwasher` | Q186263 | dishwasher |
 | `microwave` | Q127956 | microwave oven |
@@ -188,7 +291,6 @@ Q-id подтверждены через `wbsearchentities`. Заводим в s
 | `power_tool` | Q1327701 | power tool |
 | `rotary_hammer` | Q1932875 | rotary hammer |
 | `fertilizer` | Q83323 | fertilizer |
-| `book` | (категория, узкая привязка через `wikidata` на узле) | book |
 | `bicycle` | Q11442 | bicycle |
 | `motorcycle` | Q34493 | motorcycle |
 | `car` | Q1420 | car |
@@ -223,184 +325,198 @@ CREATE thing:`concept_dom_laptop` SET
   kind='concept', identifier='laptop', wikidata='Q3962',
   _i18n={ ru:{label:'Ноутбук'}, en:{label:'Laptop'} };
 RELATE thing:`concept_dom_laptop`->part_of->thing:`vocab_domovoy_category`;
-
--- Если хотим материализовать концепт самой Wikidata (для иерархии/линка на URL):
-CREATE thing:`concept_wd_q3962` SET kind='concept', identifier='Q3962';
-RELATE thing:`concept_wd_q3962`->part_of->thing:`vocab_wikidata`;
-RELATE thing:`concept_dom_laptop`->related_to->thing:`concept_wd_q3962` SET label='sameAs';
 ```
 
-Материализация концептов Wikidata — **лениво**: только когда нужна иерархия (broader/narrower через part_of) или прямая ссылка на URL.
+Материализация Wikidata-концептов — **лениво**: только когда нужна иерархия (broader/narrower) или прямая ссылка на URL.
 
-## Полная таблица миграции 56 → 29
+## Полная таблица миграции 56 → 27
 
 Сортировка по убыванию количества.
 
-| Сейчас (`kind`) | # | Куда (`kind`) | category | wikidata-якорь (категории) | Класс |
-|---|---:|---|---|---|---|
-| `инструмент` | 79 | `item` | `tool` | Q39546 (tool) | item |
-| `место` | 63 | **split** | — | — | item / location |
-| `крепёж` | 62 | `item` | `fastener` | — | item |
-| `автозапчасть` | 49 | `item` | `auto_part` | — | item |
-| `книга` | 44 | `item` | `book` | — | item |
-| `разное` | 42 | `item` | `misc` | — | item |
-| `одежда` | 42 | `item` | `clothing` | — | item |
-| `человек` | 41 | `person` | — | Q5 (для класса) | living |
-| `электроника` | 40 | **split** | — | — | item / device |
-| `электрика` | 40 | `item` | `electrical` | — | item |
-| `хозтовар` | 38 | `item` | `household` | — | item |
-| `спортинвентарь` | 38 | `item` | `sports` | — | item |
-| `садовый инвентарь` | 38 | `item` | `garden_tool` | — | item |
-| `медикамент` | 38 | `item` | `medicine` | — | item |
-| `документ` | 38 | `document` | — | — | content |
-| `платёж` | 37 | `payment` | — | — | workflow |
-| `стройматериал` | 31 | `item` | `construction` | — | item |
-| `электроинструмент` | 25 | `item` | `power_tool` | Q1327701 | item |
-| `сантехника` | 23 | `item` | `plumbing` | — | item |
-| `задача` | 23 | `task` | — | — | workflow |
-| `семена` | 21 | `item` | `seeds` | — | item |
-| `автопринадлежность` | 14 | `item` | `auto_accessory` | — | item |
-| `организация` | 13 | `org` | — | — | сущность |
-| `снаряжение` | 9 | `item` | `gear` | — | item |
-| `мотопринадлежность` | 9 | `item` | `moto_accessory` | — | item |
-| `морское снаряжение` | 9 | `item` | `marine_gear` | — | item |
-| `страница` | 7 | `page` | — | — | content |
-| `объявление` | 7 | `listing` | — | — | workflow |
-| `контакт` | 7 | `person` | — | — | living |
-| `расходник` | 6 | `item` | `consumable` | — | item |
-| `заметка` | 6 | `note` | — | — | content |
-| `саженец` | 5 | `item` | `sapling` | — | item |
-| `рыболовное` | 5 | `item` | `fishing` | — | item |
-| `периферия` | 5 | `item` | `peripheral` | — | item |
-| `навигация` | 5 | **split** | — | — | item / device |
-| `диагноз` | 5 | `diagnosis` | — | — | мед |
-| `запись` | 4 | `log_entry` | — | — | content |
-| `гаджет` | 4 | `device` | — | — | device |
-| `аудио` | 4 | `item` | `audio` | — | item |
-| `фото/видео` | 3 | `item` | `photo_video` | — | item |
-| `тара` | 3 | `item` | `container` | — | item |
-| `носитель` | 3 | `item` | `storage_media` | — | item |
-| `компьютер` | 3 | `device` | — | — | device |
-| `файл` | 2 | `file` | — | — | content |
-| `туризм` | 2 | `item` | `tourism` | — | item |
-| `субстрат` | 2 | `item` | `substrate` | — | item |
-| `запчасть` | 2 | `item` | `part` | — | item |
-| `чанк` | 1 | `chunk` | — | — | content |
-| `удобрение` | 1 | `item` | `fertilizer` | Q83323 | item |
-| `событие` | 1 | `event` | — | — | workflow |
-| `сеть` | 1 | `device` | — | — | device |
-| `мотор` | 1 | `item` | `engine` | — | item |
-| `документ-семейство` | 1 | `document_family` | — | — | content |
-| `агрохимия` | 1 | `item` | `agrochemistry` | — | item |
-| `embedding` | 1 | `embedding` | — | — | content |
+| Сейчас (`kind`) | # | Куда (`kind`) | category | Класс |
+|---|---:|---|---|---|
+| `инструмент` | 79 | `item` | `tool` (или `hand_tool`/`power_tool` по факту) | item |
+| `место` | 63 | **split** (см. особые случаи) | — | item / location |
+| `крепёж` | 62 | `item` | `fastener` | item |
+| `автозапчасть` | 49 | `item` | `auto_part` | item |
+| `книга` | 44 | `item` | `book` | item |
+| `разное` | 42 | `item` | `misc` | item |
+| `одежда` | 42 | `item` | `clothing` | item |
+| `человек` | 41 | `person` | — | living |
+| `электроника` | 40 | **split** | `electronics` / device | item / device |
+| `электрика` | 40 | `item` | `electrical` | item |
+| `хозтовар` | 38 | `item` | `household` | item |
+| `спортинвентарь` | 38 | `item` | `sports` (велосипед → `bicycle` если ведётся учёт) | item |
+| `садовый инвентарь` | 38 | `item` | `garden_tool` | item |
+| `медикамент` | 38 | `item` | `medicine` | item |
+| `документ` | 38 | `document` | — | content |
+| `платёж` | 37 | `payment` | — | workflow |
+| `стройматериал` | 31 | `item` | `construction` | item |
+| `электроинструмент` | 25 | `item` | `power_tool` | item |
+| `сантехника` | 23 | `item` | `plumbing` | item |
+| `задача` | 23 | `task` | — | workflow |
+| `семена` | 21 | `item` | `seeds` | item |
+| `автопринадлежность` | 14 | `item` | `auto_accessory` | item |
+| `организация` | 13 | `org` | — | сущность |
+| `снаряжение` | 9 | `item` | `sports` (или `tourism` для outdoor) | item |
+| `мотопринадлежность` | 9 | `item` | `moto_accessory` | item |
+| `морское снаряжение` | 9 | `item` | `marine_gear` | item |
+| `страница` | 7 | `page` | — | content |
+| `объявление` | 7 | `listing` | — | workflow |
+| `контакт` | 7 | `person` | — (различие через `participant {role:'contact'}`) | living |
+| `расходник` | 6 | `item` | `consumable` | item |
+| `заметка` | 6 | `note` | — | content |
+| `саженец` | 5 | `item` | `sapling` | item |
+| `рыболовное` | 5 | `item` | `fishing` | item |
+| `периферия` | 5 | `item` | `peripheral` | item |
+| `навигация` | 5 | **split** | `navigation` / device | item / device |
+| `диагноз` | 5 | `diagnosis` | — | мед |
+| `запись` | 4 | `log_entry` | — | content |
+| `гаджет` | 4 | `device` | — | device |
+| `аудио` | 4 | `item` | `audio` | item |
+| `фото/видео` | 3 | `item` | `photo_video` | item |
+| `тара` | 3 | `item` | `container` | item |
+| `носитель` | 3 | `item` | `storage_media` | item |
+| `компьютер` | 3 | `device` | — | device |
+| `файл` | 2 | `file` | — | content |
+| `туризм` | 2 | `item` | `tourism` | item |
+| `субстрат` | 2 | `item` | `substrate` | item |
+| `запчасть` | 2 | `item` | `auto_part` (по контексту) | item |
+| `чанк` | 1 | `chunk` | — | content |
+| `удобрение` | 1 | `item` | `fertilizer` | item |
+| `событие` | 1 | `event` | — | workflow |
+| `сеть` | 1 | `device` | — (`role='router'`) | device |
+| `мотор` | 1 | `item` | `auto_part` (мотор катера) | item |
+| `документ-семейство` | 1 | `document` | — (поле `is_family=true`) | content |
+| `агрохимия` | 1 | `item` | `growth_regulator` (если Эпин) | item |
+| `embedding` | 1 | `embedding` | — | content |
 
-## Особые случаи
+## Особые случаи: что разделяется
 
-### `место` → `vehicle` (4) + `location` (59)
+### `место` → 4 транспорта + 59 локаций
 
-Транспорт (отдельный `kind='vehicle'`, поле `wikidata`):
-- `car_vesta` → `vehicle` + `wikidata='Q17376334'`
-- `moto_bmw` → `vehicle` + `wikidata='Q57821567'`
-- `boat_viking` → `vehicle`
-- `snowmobile_arctic` → `vehicle`
+4 узла транспорта становятся `item` с категорией из иерархии `vehicle/*` и полями `vin`/`license_plate`/`brand`/`model`/`wikidata`:
 
-Остальное — `location` (включая багажники/кофры/каюты — они контейнеры внутри транспорта).
+```surql
+-- было: CREATE thing:`moto_bmw` SET kind='место', name='BMW R1250GS'
+-- стало:
+CREATE thing:`moto_bmw` SET
+  kind='item', category='motorcycle',
+  brand='bmw', model='R 1250 GS',
+  wikidata='Q57821567',
+  name='BMW R 1250 GS';
+```
+
+- `car_vesta` → `item` + `category='car'` + `wikidata='Q17376334'`
+- `boat_viking` → `item` + `category='boat'`
+- `snowmobile_arctic` → `item` + `category='snowmobile'`
+
+59 локаций (полки, шкафы, помещения, контейнеры внутри транспорта) → `kind='location'`.
+
+«Все транспортные средства» — обход иерархии `category` через `part_of` концепт `vehicle`.
 
 ### `электроника` и `навигация` → `item` (большинство) + `device` (немногие)
 
-Решение пер-узел: hostname/IP/WiFi-учётка → `device`, иначе → `item`. Конкретный список разберу при миграции и приложу.
+Решение пер-узел: hostname/IP/WiFi-учётка → `device`, иначе → `item`. Список приложу при миграции.
+
+### `документ-семейство` → `document` + флаг
+
+```surql
+-- было: CREATE thing:`reglament_to_bmw` SET kind='документ-семейство', version_policy='coexist'
+-- стало:
+CREATE thing:`reglament_to_bmw` SET
+  kind='document', is_family=true, version_policy='coexist',
+  name='Регламент ТО BMW';
+```
+
+Тот же state machine, что и у обычного документа; флаг — для версионирующей логики.
+
+### `контакт` → `person` + роль
+
+```surql
+CREATE thing:`contact_mechanic_igor` SET kind='person', name='Игорь — моторист катера';
+RELATE thing:`family_main`->participant->thing:`contact_mechanic_igor`
+  SET role='contact', note='чинит мотор по звонку';
+```
 
 ## Что добавляется (новые `kind`, не было в seed)
 
 | Новый `kind` | Источник |
 |---|---|
-| `vehicle` | split из `место` |
-| `device` | сборка из гаджет/компьютер/сеть + split электроника |
+| `device` | сборка из гаджет/компьютер/сеть + split электроника/навигация |
 | `location` | переименование `место` (без транспорта) |
 | `animal` | новый класс (примеры: кот Murka) |
 | `plant` | новый класс (примеры: грядка томатов) |
 | `log_entry` | переименование `запись` |
 | `listing` | переименование `объявление` |
 | `diagnosis` | переименование `диагноз` |
-| `document_family` | переименование `документ-семейство` |
 | `vocabulary` | новый мета — SKOS-словари |
 | `concept` | новый мета — термины |
 
+**Не добавляются (несмотря на план в прошлом аудите):**
+- `vehicle` — не прошёл тест (см. выше), сложен в `item + category`;
+- `document_family` — не прошёл тест, сложен в `document + is_family`.
+
 ## Что не входит в этот аудит
 
-- `kind`-значения, упоминаемые только в `docs/database.md`: `server`, `service`, `incident`, `event`, `chat`, `question`, `attempt`, `template`, `tag` — добавим при расширениях.
+- `kind`-значения, упоминаемые только в `docs/database.md` (нет узлов в seed): `server`, `service`, `incident`, `event`, `chat`, `question`, `attempt`, `template`, `tag` — добавим при расширениях.
 - Поле `status` — отдельная миграция, после `kind`; станет `vocab:domovoy_status`.
-- Bulk-импорт внешних словарей (ICD-10/Linnaean/CPE) — лениво, концепты по факту использования.
-
-## Категория-как-концепт
-
-Каждое значение поля `category` — это **slug**, ссылающийся в `vocab:domovoy_category` по `identifier`. Концепт несёт `_i18n` метки и `wikidata` Q-id класса.
-
-```surql
-CREATE thing:`udobr_npk_5kg` SET kind='item', category='fertilizer',
-  brand='bosch', wikidata='Q83323',   -- класс «удобрение» / можно опустить
-  name='Удобрение NPK 5кг';
-```
-
-Иерархия (broader/narrower) — через `part_of` между концептами; только там, где имеет смысл для запросов.
+- Bulk-импорт внешних словарей — лениво, по факту использования.
 
 ## Чек-лист миграции (после одобрения)
 
 1. **seed.surql — основной массив (1004 узла)**:
    - заменить все `kind = 'X'` по таблице;
    - для `item`-узлов добавить `category` (slug);
-   - для `vehicle`-узлов добавить `brand`, `model`, `wikidata` (где есть Q-id);
-   - для `device`-узлов добавить `role`, опц. `mac`/`hostname`/`wikidata`;
-   - 4 узла из `место` отделить в `vehicle`;
-   - 13 узлов `контакт` мигрировать в `person` с `participant {role:'contact'}` или полем;
-   - шапку seed обновить под новый итог.
+   - для транспорта (4 узла из `место`): `category=motorcycle/car/boat/snowmobile`, поля `brand`/`model`/`vin`/`license_plate`/`wikidata`;
+   - для `device`-узлов: `role` (workstation/tablet/phone/reader/router/iot), опц. `mac`/`hostname`/`wikidata`;
+   - 13 узлов `контакт` → `person` + `participant {role:'contact'}`;
+   - 1 узел `документ-семейство` → `document` + `is_family=true`;
+   - шапку seed обновить.
 
 2. **seed.surql — словари (новый блок в начале)**:
-   - **Свои**: `vocab:domovoy_kind` (29 концептов), `vocab:domovoy_edge` (27), `vocab:domovoy_category` (~35), `vocab:domovoy_brand` (5 стартовых: apple/bmw/bosch/lenovo/makita).
-   - **Внешние стартовые**: `vocab:wikidata` (узел словаря + ~20 концептов из таблицы выше), `vocab:iso_4217` (RUB+ при необходимости), `vocab:iso_639` (ru, en), `vocab:iana_mime` (по факту).
-   - **Cross-links**: для каждого `concept` в `vocab:domovoy_category` поле `wikidata=Q...` (где есть); опц. `related_to {label:'sameAs'} → concept_wd_QXXX`.
+   - **Свои**: `vocab:domovoy_kind` (27 концептов), `vocab:domovoy_edge` (27), `vocab:domovoy_category` (~50 концептов с иерархией `part_of`), `vocab:domovoy_brand` (5 стартовых).
+   - **Внешние стартовые**: `vocab:wikidata` (узел + ~20 концептов из таблицы), `vocab:iso_4217` (RUB+), `vocab:iso_639` (ru, en), `vocab:iana_mime` (по факту).
+   - **Cross-links**: на каждом `concept` в `vocab:domovoy_category` поле `wikidata=Q...` (где есть).
 
-3. **seed.surql — примеры living + внешние якоря**:
-   - `pet_murka` (`animal`, кошка) + `wikidata='Q146'` + `located_at`;
-   - `tomato_bed_3` (`plant`) + `wikidata='Q23501'` + `located_at`;
+3. **seed.surql — примеры living**:
+   - `pet_murka` (`animal`, кошка, `wikidata='Q146'`) + `located_at`;
+   - `tomato_bed_3` (`plant`, `wikidata='Q23501'`) + `located_at`;
    - 1 `appointment` для демонстрации reuse мед-паттерна.
 
-4. **docs/relation-typing.md** — обновить примеры под ASCII-`kind` + SKOS-унификацию.
+4. **docs/relation-typing.md** — ASCII-`kind` + SKOS-унификация в примерах.
 
-5. **docs/database.md** — добавить:
-   - короткую таблицу «4 класса бытия»;
-   - раздел «Внешние якоря: соглашение о полях» с таблицей по классам;
+5. **docs/database.md** — точечно:
+   - короткая таблица «4 класса бытия» и **тест на отдельный `kind`** в начало;
+   - раздел «Внешние якоря: соглашение о полях»;
    - подменить русские `kind` в примерах кода (выборочно).
 
 6. **scripts/generate_seed.py** — обновить генератор (отдельным коммитом).
 
-Объём: ~1000 строк правок в seed, ~400 новых строк (словари + концепты + living + внешние), ~150 строк правок в docs. Один проход.
+Объём: ~1000 строк правок в seed, ~400 новых строк (словари + концепты + иерархия + living), ~150 строк правок в docs. Один проход.
 
 ## Открытые вопросы
 
-1. **`server` и `service`** — `server` схлопнуть в `device` с `role='server'`?
-   *Рекомендация: схлопнуть.*
+1. **`server` и `service`** — `server` → `device` с `role='server'` (рекомендация: схлопнуть).
 
-2. **`book`** — `item` (бумажная) или собственный `kind`?
-   *Рекомендация: `item` в этом seed; контент книги — отдельный `document` + `represents` к item-книге.*
+2. **`book`** — `item` (как сейчас) или собственный `kind`? Тест: нет эксклюзивных рёбер, нет отдельного state machine. **Вердикт: `item` + `category='book'`**. Содержимое книги, если появится — отдельный `document` + `represents` к item-книге.
 
-3. **`device`-кандидаты в `электроника`** — список приложу при миграции.
+3. **`device`-кандидаты в `электроника` и `навигация`** — конкретный список приложу при миграции.
 
-4. **`role` на `device`** — финальный список: `server`, `workstation`, `tablet`, `phone`, `reader`, `router`, `iot`, `appliance`. Добавить?
+4. **`role` на `device`** — финальный список: `server`, `workstation`, `tablet`, `phone`, `reader`, `router`, `iot`, `appliance`. Дополнить?
 
 5. **`animal`/`plant` примеры** — кошка + грядка томатов, или реальные твои?
 
-6. **`tag`** — отдельный `kind` или концепт в `vocab:domovoy_tag`?
-   *Рекомендация: оставить `kind='tag'` (теги — ad-hoc пользовательские, не курируемый словарь).*
+6. **`tag`** — отдельный `kind` (рекомендация) или концепт в `vocab:domovoy_tag`?
 
-7. **`wikidata` поле — на каждом узле или только где есть?**
-   *Рекомендация: optional, заводим где есть Q-id. Денормализация для скорости; авторитет в графе через концепт.*
+7. **`wikidata` поле — на каждом узле?** Optional, заводим где есть Q-id. Денормализация для скорости; авторитет в графе через концепт.
 
-8. **Стратегия материализации внешних концептов** — заводить `concept`-узел Wikidata каждый раз, когда указали `wikidata=Q...` на любом узле, или лениво по требованию (только когда нужны иерархия/URL)?
-   *Рекомендация: лениво. Поле `wikidata` достаточно для 95% запросов; материализация концепта — когда нужны связи.*
+8. **Стратегия материализации Wikidata-концептов** — лениво (рекомендация: поле `wikidata` достаточно для 95% запросов; материализуем `concept`-узел только при необходимости иерархии/URL).
+
+9. **Иерархия категорий — глубина на старте.** Закладываем дерево (см. выше) или начинаем плоско? **Рекомендация: дерево для очевидных пар (`vehicle/*`, `tool/*`, `agrochemistry/*`, `garden_supplies/*`, `vehicle_supplies/*`), остальное плоско до плотности.**
 
 ## Резюме
 
-> 56 русских `kind`-значений → 29 ASCII-канонических; категории-под-видом-kind уезжают в поле + концепт в словаре; контролируемые перечисления унифицированы под SKOS (`vocabulary` + `concept`) **без новых рёбер**; внешние якоря (Wikidata Q-id, ISO коды, GTIN/ISBN/VIN/CVE/...) — **денормализованные поля на узлах** с парным концептом в графе; верифицированный стартовый набор Wikidata Q-id для уже существующих сущностей в seed заложен сразу, чтобы потом не переделывать структуру.
+> Введён **строгий тест** на отдельный `kind` (эксклюзивные рёбра / разный state machine / разная природа) и **пять принципов категоризации** (одна метка, workflow > химии, Wikidata за тебя, многомерность через теги, начинай широко). По этому тесту `vehicle` и `document_family` **не прошли** и сложены в `item + category` и `document + флаг`. Итог: 56 русских `kind` → **27** ASCII-канонических; категории становятся **деревом** с очевидной иерархией; контролируемые перечисления унифицированы под SKOS (`vocabulary` + `concept`) без новых рёбер; внешние якоря (Wikidata Q-id, ISO коды, GTIN/ISBN/VIN/CVE/…) — денормализованные поля на узлах с парным концептом в графе; верифицированный стартовый набор Wikidata Q-id заложен сразу.
 
-Жду одобрения и ответов на 8 вопросов — после этого миграция одним коммитом.
+Жду одобрения и ответов на 9 вопросов — после этого миграция одним коммитом.
