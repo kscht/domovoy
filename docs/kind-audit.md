@@ -118,7 +118,7 @@ Workflow/события: task, appeal, payment, event, incident, listing, diagno
 |---|---|---|
 | `vocab:domovoy_kind` | 27 канонических `kind` | 27 |
 | `vocab:domovoy_edge` | 27 типов рёбер | 27 |
-| `vocab:domovoy_category` | категории для `item` (иерархия — см. ниже) | ~50 |
+| `vocab:domovoy_category` | категории для `item` (иерархия — см. ниже) | ~65 |
 | `vocab:domovoy_brand` | бренды | растёт |
 | `vocab:domovoy_status` | enum статусов | ~10 |
 | `vocab:domovoy_role` | `role` на `device` | ~8 |
@@ -215,60 +215,102 @@ RELATE thing:`concept_brand_bosch`->part_of->thing:`vocab_domovoy_brand`;
 
 ## Иерархия категорий в `vocab:domovoy_category`
 
-Закладываем дерево сразу для очевидных parent-child пар. Остальное — плоско до появления плотности. Все категории — `kind='concept'`, иерархия через `part_of` между ними.
+Закладываем дерево сразу для очевидных кластеров; плоско — для остального до появления плотности. Все категории — `kind='concept'`, иерархия через `part_of` между ними.
 
 ```
-food                          ← новая широкая категория
-reagent (chemistry)           ← новая широкая категория для реактивов
-cleaning                      ← новая широкая категория
-medicine
-tool
-├── hand_tool
-└── power_tool
-    └── rotary_hammer
-vehicle                       ← была kind, теперь концепт-категория
-├── car
-├── motorcycle
-├── boat
-├── snowmobile
-└── bicycle
-vehicle_supplies
-├── auto_part
-├── auto_accessory
-└── moto_accessory
-garden_supplies
-├── garden_tool
-├── seeds
-├── sapling
-├── substrate
-└── agrochemistry
-    ├── fertilizer
-    ├── growth_regulator
-    └── pesticide
-household_supplies
-├── household
-├── consumable
-├── container               ← бывшая "тара"
-└── fastener
-sports
-├── fishing
-├── marine_gear
-└── tourism
-electronics                  ← в коробке, без сети
-electrical                   ← розетки/провода/выключатели
-plumbing
-construction
-clothing
-book
-audio                        ← наушники/колонки bluetooth
-storage_media                ← флешки/SSD/HDD
-peripheral                   ← мониторы/клавы/мыши
-navigation
-photo_video
-misc                         ← честное "не классифицировал"
+РАСХОДНИКИ
+  food                       продукты, напитки, специи
+  personal_care              косметика, гигиена, парфюм, бритьё
+  ├── hygiene
+  ├── cosmetics
+  ├── dental
+  ├── fragrance
+  ├── shaving
+  └── hair_care
+  cleaning                   бытовая химия (для поверхностей, не тела)
+  medicine                   аптечка
+  reagent                    хим. реактивы (мастерская/гараж)
+
+ДОЛГОВРЕМЕННЫЕ ПРЕДМЕТЫ
+  furniture                  стол, стул, кровать, шкаф, диван
+  kitchenware                посуда, кастрюли, ножи, доски
+  linens                     постельное, полотенца, скатерти
+  clothing                   одежда (footwear/outerwear/accessories — позже)
+  book                       бумажные книги (контент → kind='document')
+  office                     канцелярка (ручки, бумага, картриджи)
+  toys                       детские игрушки, конструкторы
+  pet_supplies               корм, наполнитель, поводки, лежанки
+  art_supplies               краски, кисти, нитки, ткани, выкройки
+  music                      инструменты, медиаторы, струны, ноты
+  decorations                ёлочные игрушки, гирлянды, сезонные
+  paperwork                  физические оригиналы документов (паспорта,
+                             договоры) — отдельно от kind='document'
+
+ЭЛЕКТРОНИКА / МЕДИА (без сети — иначе → kind='device')
+  electronics                в коробке, платы, датчики
+  electrical                 розетки, провода, выключатели
+  audio                      bluetooth-наушники/колонки
+  storage_media              флешки, SSD, HDD на полке
+  peripheral                 мониторы, клавы, мыши
+  navigation                 бумажные карты, компас
+  media_archive              винил, кассеты, VHS, CD/DVD, фотоальбомы
+  photography_gear           фотоаппарат, объектив, штатив, вспышка
+
+ИНСТРУМЕНТЫ
+  tool
+  ├── hand_tool
+  └── power_tool
+      └── rotary_hammer
+
+ТРАНСПОРТ
+  vehicle                    бывшая kind, теперь концепт-категория
+  ├── car
+  ├── motorcycle
+  ├── boat
+  ├── snowmobile
+  └── bicycle
+  vehicle_supplies
+  ├── auto_part
+  ├── auto_accessory
+  └── moto_accessory
+
+ДОМ И СТРОЙКА
+  construction               стройматериалы
+  plumbing                   сантехника
+  household_supplies
+  ├── household              хозтовары
+  ├── consumable             расходники
+  ├── container              тара
+  └── fastener               крепёж
+
+САД И СПОРТ
+  garden_supplies
+  ├── garden_tool
+  ├── seeds
+  ├── sapling
+  ├── substrate
+  └── agrochemistry
+      ├── fertilizer
+      ├── growth_regulator
+      └── pesticide
+  sports
+  ├── fishing
+  ├── marine_gear
+  └── tourism                outdoor (мангалы, шатры, термосы)
+
+ОБЩЕЕ
+  misc                       честное "не классифицировал"
 ```
 
-Принцип «начинай широко»: если у тебя пять реактивов в шкафу — `reagent` хватит. Когда наберётся 80 и захочется отдельно фильтровать кислоты/основания/растворители — заводишь подконцепты, переразмечаешь часть айтемов. Граф не ломается.
+**~65 концептов** в `vocab:domovoy_category` после миграции.
+
+Принцип «начинай широко» применяется *внутри* кластеров. Если у тебя пять реактивов в шкафу — `reagent` без подкатегорий. Когда наберётся 80 и захочется отдельно фильтровать кислоты/основания/растворители — заводишь подконцепты, переразмечаешь часть айтемов. **Закладываем сейчас только те поддеревья, где парент-чайлд очевиден** (vehicle/*, tool/*, agrochemistry/*, household_supplies/*, garden_supplies/*, sports/*, personal_care/*) — остальное плоско.
+
+**Кандидаты на будущее дробление** (когда вырастет плотность):
+- `clothing` → `footwear` / `outerwear` / `accessories`
+- `food` → `beverage` / `condiment`
+- `medicine` → `medical_equipment` (для не-сетевого тонометра/глюкометра)
+- `office` → `stationery` vs `office_consumables`
 
 ## Стартовый набор концептов с Wikidata Q-id (верифицировано)
 
@@ -374,7 +416,7 @@ RELATE thing:`concept_dom_laptop`->part_of->thing:`vocab_domovoy_category`;
 | `запись` | 4 | `log_entry` | — | content |
 | `гаджет` | 4 | `device` | — | device |
 | `аудио` | 4 | `item` | `audio` | item |
-| `фото/видео` | 3 | `item` | `photo_video` | item |
+| `фото/видео` | 3 | `item` | `media_archive` (или `photography_gear` пер-айтем) | item |
 | `тара` | 3 | `item` | `container` | item |
 | `носитель` | 3 | `item` | `storage_media` | item |
 | `компьютер` | 3 | `device` | — | device |
@@ -430,6 +472,17 @@ CREATE thing:`reglament_to_bmw` SET
 ```
 
 Тот же state machine, что и у обычного документа; флаг — для версионирующей логики.
+
+### `разное` → пер-айтем split
+
+42 узла под `kind='разное'` — на самом деле смесь:
+- фотоальбомы / VHS / CD-DVD / винил → `category='media_archive'` (~5–8 айтемов)
+- старые игрушки в коробке → `toys` (если найдутся)
+- канцелярка → `office`
+- декорации/гирлянды → `decorations`
+- остальное → `misc` (честно)
+
+Конкретное распределение разберу пер-айтем при миграции и приложу мини-таблицу.
 
 ### `контакт` → `person` + роль
 
@@ -517,6 +570,6 @@ RELATE thing:`family_main`->participant->thing:`contact_mechanic_igor`
 
 ## Резюме
 
-> Введён **строгий тест** на отдельный `kind` (эксклюзивные рёбра / разный state machine / разная природа) и **пять принципов категоризации** (одна метка, workflow > химии, Wikidata за тебя, многомерность через теги, начинай широко). По этому тесту `vehicle` и `document_family` **не прошли** и сложены в `item + category` и `document + флаг`. Итог: 56 русских `kind` → **27** ASCII-канонических; категории становятся **деревом** с очевидной иерархией; контролируемые перечисления унифицированы под SKOS (`vocabulary` + `concept`) без новых рёбер; внешние якоря (Wikidata Q-id, ISO коды, GTIN/ISBN/VIN/CVE/…) — денормализованные поля на узлах с парным концептом в графе; верифицированный стартовый набор Wikidata Q-id заложен сразу.
+> Введён **строгий тест** на отдельный `kind` (эксклюзивные рёбра / разный state machine / разная природа) и **пять принципов категоризации** (одна метка, workflow > химии, Wikidata за тебя, многомерность через теги, начинай широко). По этому тесту `vehicle` и `document_family` **не прошли** и сложены в `item + category` и `document + флаг`. Итог: 56 русских `kind` → **27** ASCII-канонических; **~65 концептов категорий** деревом по 9 кластерам (расходники, долговременные, электроника/медиа, инструменты, транспорт, дом/стройка, сад, спорт, общее); контролируемые перечисления унифицированы под SKOS (`vocabulary` + `concept`) без новых рёбер; внешние якоря (Wikidata Q-id, ISO коды, GTIN/ISBN/VIN/CVE/…) — денормализованные поля на узлах с парным концептом в графе; верифицированный стартовый набор Wikidata Q-id заложен сразу.
 
 Жду одобрения и ответов на 9 вопросов — после этого миграция одним коммитом.
